@@ -1,0 +1,32 @@
+<launch>
+  <arg name="csv_path"/>
+  <arg name="target_speed" default="0.20"/>
+  <arg name="odom_topic" default="/Odometry"/>
+  <arg name="cmd_topic" default="/smoother_cmd_vel"/>
+  <arg name="required_task_sets" default="1"/>
+  <arg name="arm_config" default="$(find piper_task)/config/task_config.yaml"/>
+
+  <!-- 机械臂识别、抓取和放置任务节点。 -->
+  <include file="$(find piper_task)/launch/piper_task.launch">
+    <arg name="config" value="$(arg arm_config)"/>
+  </include>
+
+  <!-- 只做普通路径跟踪和七点停车，不启动重定位、红绿灯或避障。 -->
+  <node pkg="piper_task"
+        type="arm_function_test_follower.py"
+        name="arm_function_test_follower"
+        output="screen"
+        required="true">
+    <param name="csv_path" value="$(arg csv_path)"/>
+    <param name="odom_topic" value="$(arg odom_topic)"/>
+    <param name="cmd_topic" value="$(arg cmd_topic)"/>
+    <param name="target_speed" value="$(arg target_speed)"/>
+    <param name="task_event_topic" value="/waypoint_task_event"/>
+    <param name="task_done_topic" value="/waypoint_task_done"/>
+    <param name="skip_topic" value="/piper_task/navigation_skip"/>
+    <param name="arm_state_topic" value="/piper_task/state"/>
+    <param name="external_task_timeout" value="180.0"/>
+    <param name="unknown_task_policy" value="skip"/>
+    <param name="required_task_sets" value="$(arg required_task_sets)"/>
+  </node>
+</launch>

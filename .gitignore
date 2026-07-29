@@ -1,0 +1,46 @@
+# ---------------- catkin 构建产物 ----------------
+build/
+devel/
+install/
+log/
+logs/
+.catkin_tools/
+.catkin_workspace
+
+**/build/
+**/devel/
+**/install/
+
+# ---------------- Python ----------------
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# ---------------- YOLOv5 官方预训练权重 ----------------
+# 这些不是自训练模型，体积大且可重新下载：
+#   cd src/realsense-D455-YOLOV5/weights && bash download_weights.sh
+# yolov5x.pt 达 171MB，超过 GitHub 单文件 100MB 硬限制，必须排除。
+# 自训练权重 bb6_300.pt（piper_task 六分类）和 bottle.pt（piper_mission）
+# 体积小且不可重新生成，不在此列，会正常提交。
+src/realsense-D455-YOLOV5/weights/yolov5s.pt
+src/realsense-D455-YOLOV5/weights/yolov5m.pt
+src/realsense-D455-YOLOV5/weights/yolov5l.pt
+src/realsense-D455-YOLOV5/weights/yolov5x.pt
+
+# ---------------- 运行产物与数据 ----------------
+*.bag
+*.pcd
+*.ply
+*.log
+*.tmp
+runs/
+inference/output/
+
+# ---------------- 编辑器 ----------------
+.vscode/
+.idea/
+.claude/
+.codex
+*.swp

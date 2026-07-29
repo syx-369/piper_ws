@@ -1,0 +1,44 @@
+rosservice call /start_episode
+
+rosservice call /save_episode
+
+rosservice call /discard_episode
+
+rosservice call /finalize_dataset
+1、主从臂直接把can接起来，然后一个usb，两个电源都接上，最后把主从臂的电源打开就行了。
+2、打开终端，输入以下命令：
+pkill -f piper_ctrl_single_node.py
+pkill -f candump
+
+sudo ip link set can0 down 2>/dev/null
+sudo ip link set can0 type can bitrate 1000000 restart-ms 100
+sudo ip link set can0 txqueuelen 1000
+sudo ip link set can0 up
+
+ip -details -statistics link show can0
+3、然后开驱动
+roslaunch realsense2_camera rs_camera.launch \
+  enable_color:=true \
+  enable_depth:=false \
+  enable_infra1:=false \
+  enable_infra2:=false \
+  color_width:=640 \
+  color_height:=480 \
+  color_fps:=30
+
+  source devel/setup.bash
+  roslaunch piper start_single_piper.launch
+4、运行命令
+/usr/bin/python3 /home/user/piper_ws/src/piper_ros/src/piper/scripts/piper_gr00t_recorder_only.py \
+  _camera_topic:=/camera/color/image_raw \
+  _state_topic:=/joint_states_single \
+  _action_source:=future_state \
+  _dataset_root:=/home/user/piper_ws/src/piper_ros/src/piper/scripts/dataset \
+  _task:="Pick up the red block and place it on the blue block." \
+  _fps:30 \
+  _resize_height:=256 \
+  _resize_width:=256 \
+  _max_age_ms:=50.
+
+
+  python3 /home/user/piper_ws/src/piper_ros/src/piper/scripts/check_piper_dataset.py

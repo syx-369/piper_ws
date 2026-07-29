@@ -1,0 +1,19 @@
+<launch>
+  <arg name="config" default="$(find piper_task)/config/task_config.yaml"/>
+
+  <rosparam file="$(arg config)" command="load" ns="piper_task"/>
+
+  <node pkg="piper_task"
+        type="piper_task_node.py"
+        name="piper_task"
+        output="screen"
+        required="true">
+    <param name="command_topic" value="/piper_task/command"/>
+    <param name="state_topic" value="/piper_task/state"/>
+    <param name="result_topic" value="/piper_task/result"/>
+    <param name="target_topic" value="/piper_task/target"/>
+    <param name="waypoint_event_topic" value="/waypoint_task_event"/>
+    <param name="waypoint_done_topic" value="/waypoint_task_done"/>
+    <param name="navigation_skip_topic" value="/piper_task/navigation_skip"/>
+  </node>
+</launch>

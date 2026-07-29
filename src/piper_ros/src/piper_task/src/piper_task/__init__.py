@@ -1,0 +1,1 @@
+"""Piper competition task package."""

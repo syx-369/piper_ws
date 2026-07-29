@@ -1,0 +1,23 @@
+model_path: /home/user/piper_ws/src/realsense-D455-YOLOV5/weights/bottle.pt
+target_label: ""
+show_image: true
+release_camera_after_task: true
+
+# Joint order: joint1 joint2 joint3 joint4 joint5 joint6 gripper
+scan_joint_position: [1.521, 0.403, -0.521, 0.0, 0.808, 0.0, 0.0]
+stow_joint_position: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+place_joint_position: [1.521, 0.403, -0.521, 0.0, 0.808, 0.0, 0.0]
+
+# Pick offsets are in the detected bottle/grasp frame, meters.
+# Tune the second value first for left/right centering between the fingers.
+pick_pre_offset: [0.0, -0.032, 0.0]
+pick_approach_offset: [0.0, -0.032, 0.04]
+pick_lift_offset: [-0.15, -0.032, 0.04]
+
+# If place_use_vision is false and place_pose has 6 values, place_pose is used.
+# Format: [x, y, z, roll, pitch, yaw] in Piper arm base frame, radians.
+# Leave empty first, tune with RViz and real robot after the arm is mounted.
+# Keep place behavior aligned with xiaosai/grab2016_5_28_3.py:
+# move to camera pose, detect the placement target, move above it, open gripper.
+place_use_vision: true
+place_pose: []

@@ -1,0 +1,16 @@
+<launch>
+  <arg name="config" default="$(find piper_mission)/config/arm_task.yaml"/>
+
+  <node pkg="piper_mission"
+        type="arm_task_server.py"
+        name="arm_task_server"
+        output="screen">
+    <rosparam file="$(arg config)" command="load"/>
+    <param name="cmd_topic" value="/arm_task_cmd"/>
+    <param name="result_topic" value="/arm_task_result"/>
+    <param name="state_topic" value="/arm_task_state"/>
+    <param name="pin_pos_topic" value="/pin_pos_cmd"/>
+    <param name="joint_cmd_topic" value="/joint_states"/>
+    <param name="end_pose_topic" value="/end_pose"/>
+  </node>
+</launch>

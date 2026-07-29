@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy
+from piper_msgs.msg import PosCmd
+import math
+
+def s_curve(t, T):
+    """五次多项式 S-curve，t∈[0,T]"""
+    tau = max(0.0, min(t / T, 1.0))
+    return 10*tau**3 - 15*tau**4 + 6*tau**5
+
+def descend_motion():
+    rospy.init_node("jerk_limited_scurve", anonymous=True)
+    pub = rospy.Publisher("/pin_pos_cmd", PosCmd, queue_size=1)
+    rospy.sleep(0.5)
+
+    # ===== 固定参数 =====
+    y = 0.0
+    z = 0.12
+    roll, pitch, yaw = 0.0, 1.57, 0.0
+
+    x_start = 0.34
+    x_end   = 0.47
+    dx = x_end - x_start
+
+    # ===== 时间规划（核心）=====
+    T = 6.0              # 总运动时间（秒）⬅️ 越大越稳
+    rate_hz = 200
+    dt = 1.0 / rate_hz
+
+    rate = rospy.Rate(rate_hz)
+    t = 0.0
+
+    while t <= T and not rospy.is_shutdown():
+        s = s_curve(t, T)
+        x = x_start + dx * s
+
+        cmd = PosCmd()
+        cmd.x = x
+        cmd.y = y
+        cmd.z = z
+        cmd.roll  = roll
+        cmd.pitch = pitch
+        cmd.yaw   = yaw
+        cmd.gripper = 0
+        cmd.mode1 = 1
+        cmd.mode2 = 0
+
+        pub.publish(cmd)
+
+        t += dt
+        rate.sleep()
+
+if __name__ == "__main__":
+    descend_motion()
