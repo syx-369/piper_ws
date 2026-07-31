@@ -8,17 +8,53 @@ vision_grasp_core.py；该文件是 grab2016_7_21.py 的原样副本。
 本节点只增加：任务触发、抓放阶段拆分、已录制路径播放以及两轮状态管理。
 """
 
+import os
 import queue
+import sys
 import threading
 import time
 
 import numpy as np
 import rospy
+import rospkg
 import tf.transformations as tf_trans
 from geometry_msgs.msg import PoseStamped
 from piper_msgs.msg import PosCmd
+from piper_msgs.srv import GoZero
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
+
+# ===== 改动 2026-07-30（1/3）：接入 final_mission 的相机按需中继 =====
+# 原因：全车只有一台 D435i 且装在机械臂上，pyrealsense2 设备独占，
+# 本节点在 init_camera_and_detector() 就 pipeline.start() 并全程持有，
+# 所以 final_mission 的红旗/红绿灯识别没法自己开相机。
+# 解法：本节点保持唯一相机持有者，按需把帧发成 ROS 话题。
+#
+# 默认关闭（enable_camera_relay=false）。不打开时本文件行为与改动前完全一致。
+# 打开方式：roslaunch piper_task piper_task.launch enable_camera_relay:=true
+#           或 rosrun 时加 _enable_camera_relay:=true
+#
+# 若 final_mission 包不存在（例如单独用 piper_ws），这里静默跳过，不影响启动。
+try:
+    _FINAL_MISSION_SCRIPTS = os.path.join(
+        rospkg.RosPack().get_path("final_mission"), "scripts"
+    )
+    if _FINAL_MISSION_SCRIPTS not in sys.path:
+        sys.path.insert(0, _FINAL_MISSION_SCRIPTS)
+    from camera_relay import CameraRelayMixin
+    _HAS_CAMERA_RELAY = True
+except Exception:
+    _HAS_CAMERA_RELAY = False
+
+    class CameraRelayMixin:
+        """找不到 final_mission 时的空实现，保证本节点照常启动。"""
+
+        def start_frame_relay(self):
+            pass
+
+        def set_relay_paused(self, paused):
+            pass
+# ===== 改动结束（1/3）=====
 
 from piper_task.vision_grasp_core import (
     LABEL_DESCRIPTION,
@@ -35,7 +71,8 @@ PLACE_SCAN_JOINTS = [-1.602, 0.641, -0.509, 0.0, 0.324, 0.0, 0.0]
 JOINT_MOVE_WAIT = 8.0
 
 
-class CompetitionVisionController(PiperVisionController):
+# 改动 2026-07-30（2/3）：混入 CameraRelayMixin（原为 PiperVisionController 单继承）
+class CompetitionVisionController(CameraRelayMixin, PiperVisionController):
     """使用固定 ROS 节点名初始化原测试脚本的视觉控制器。"""
 
     def __init__(self):
@@ -48,7 +85,15 @@ class CompetitionVisionController(PiperVisionController):
 
         self.current_ee_pose_mat = np.eye(4)
         self.pose_received = False
+        self.startup_joint_positions = None
+        self.startup_joint_received_at = None
         rospy.Subscriber("/end_pose", PoseStamped, self.pose_callback)
+        self.startup_joint_sub = rospy.Subscriber(
+            rospy.get_param("~startup_joint_state_topic", "/joint_states_single"),
+            JointState,
+            self.startup_joint_callback,
+            queue_size=10,
+        )
 
         rospy.loginfo("等待获取机械臂实时位姿 (/end_pose)...")
         while not self.pose_received and not rospy.is_shutdown():
@@ -57,7 +102,108 @@ class CompetitionVisionController(PiperVisionController):
             raise rospy.ROSInterruptException("等待 /end_pose 时节点被关闭")
         rospy.loginfo("成功接入实时位姿反馈！")
 
+        if bool(rospy.get_param("~startup_go_zero", True)):
+            self.go_zero_and_wait()
+        else:
+            rospy.logwarn("startup_go_zero=false：跳过启动回零。")
+
         self.init_camera_and_detector()
+
+        # 改动 2026-07-30（2/3）：相机就绪后启动按需中继。
+        # 必须在 init_camera_and_detector() 之后 —— 中继要用 self.pipeline。
+        self.start_frame_relay()
+
+    def startup_joint_callback(self, msg):
+        if len(msg.position) < 6:
+            return
+        self.startup_joint_positions = tuple(float(value) for value in msg.position[:6])
+        self.startup_joint_received_at = time.monotonic()
+
+    def go_zero_and_wait(self):
+        """启动时调用驱动回零服务，并等待六个关节真实收敛到零位。"""
+        service_name = rospy.get_param("~go_zero_service", "/go_zero_srv")
+        wait_service_timeout = max(
+            0.1, float(rospy.get_param("~go_zero_service_timeout", 10.0))
+        )
+        motion_timeout = max(
+            0.1, float(rospy.get_param("~go_zero_motion_timeout", 30.0))
+        )
+        tolerance = max(
+            0.001, float(rospy.get_param("~go_zero_joint_tolerance", 0.05))
+        )
+        stable_samples_required = max(
+            1, int(rospy.get_param("~go_zero_stable_samples", 5))
+        )
+        is_mit_mode = bool(rospy.get_param("~go_zero_is_mit_mode", False))
+
+        rospy.loginfo(
+            "启动回零：等待服务 %s（service %.1fs / motion %.1fs），"
+            "is_mit_mode=%s，关节容差=%.3frad，稳定帧=%d",
+            service_name,
+            wait_service_timeout,
+            motion_timeout,
+            is_mit_mode,
+            tolerance,
+            stable_samples_required,
+        )
+        try:
+            rospy.wait_for_service(service_name, timeout=wait_service_timeout)
+            response = rospy.ServiceProxy(service_name, GoZero)(
+                is_mit_mode=is_mit_mode
+            )
+        except (rospy.ROSException, rospy.ServiceException) as exc:
+            raise RuntimeError("启动回零服务调用失败：%s" % exc)
+
+        if not response.status:
+            raise RuntimeError(
+                "启动回零服务拒绝请求：status=false code=%s" % response.code
+            )
+
+        rospy.loginfo(
+            "回零指令已发送（code=%s），等待关节反馈实际到零位。", response.code
+        )
+        deadline = time.monotonic() + motion_timeout
+        stable_samples = 0
+        last_max_error = float("inf")
+        rate = rospy.Rate(20)
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            positions = self.startup_joint_positions
+            received_at = self.startup_joint_received_at
+            feedback_fresh = (
+                positions is not None
+                and received_at is not None
+                and time.monotonic() - received_at <= 1.0
+            )
+            if feedback_fresh:
+                last_max_error = max(abs(value) for value in positions)
+                if last_max_error <= tolerance:
+                    stable_samples += 1
+                    if stable_samples >= stable_samples_required:
+                        rospy.loginfo(
+                            "机械臂启动回零完成：最大关节误差 %.4frad，连续 %d 帧合格。",
+                            last_max_error,
+                            stable_samples,
+                        )
+                        self.startup_joint_sub.unregister()
+                        return
+                else:
+                    stable_samples = 0
+            rate.sleep()
+
+        if rospy.is_shutdown():
+            raise rospy.ROSInterruptException("等待机械臂启动回零时节点被关闭")
+        raise RuntimeError(
+            "机械臂启动回零超时 %.1fs：最大关节误差 %s，"
+            "未达到 %.3frad×%d 帧；拒绝开放 piper_task。"
+            % (
+                motion_timeout,
+                "无有效反馈"
+                if not np.isfinite(last_max_error)
+                else "%.4frad" % last_max_error,
+                tolerance,
+                stable_samples_required,
+            )
+        )
 
 
 class CompetitionTaskNode:
@@ -224,6 +370,10 @@ class CompetitionTaskNode:
                 continue
 
             self.busy = True
+            # 改动 2026-07-30（3/3）：机械臂动作期间暂停相机中继。
+            # vision_grasp_core 只在 :443 和 :609 两处 wait_for_frames，
+            # 都在本区间内；pyrealsense2 不允许并发调用，必须让中继避让。
+            self.arm.set_relay_paused(True)
             try:
                 ok = self.execute_command(command)
                 if ok and waypoint_task_name:
@@ -235,6 +385,8 @@ class CompetitionTaskNode:
                 self.publish_result("failed:%s:exception" % command)
             finally:
                 self.busy = False
+                # 改动 2026-07-30（3/3）：动作结束，允许中继继续取帧
+                self.arm.set_relay_paused(False)
                 self.publish_state("idle")
                 self.command_queue.task_done()
 
@@ -496,3 +648,6 @@ if __name__ == "__main__":
         main()
     except rospy.ROSInterruptException:
         pass
+    except RuntimeError as exc:
+        rospy.logfatal("piper_task 启动失败：%s", exc)
+        raise

@@ -1,5 +1,7 @@
 <launch>
   <arg name="config" default="$(find piper_task)/config/task_config.yaml"/>
+  <arg name="enable_camera_relay" default="false"/>
+  <arg name="startup_go_zero" default="true"/>
 
   <rosparam file="$(arg config)" command="load" ns="piper_task"/>
 
@@ -15,5 +17,7 @@
     <param name="waypoint_event_topic" value="/waypoint_task_event"/>
     <param name="waypoint_done_topic" value="/waypoint_task_done"/>
     <param name="navigation_skip_topic" value="/piper_task/navigation_skip"/>
+    <param name="enable_camera_relay" value="$(arg enable_camera_relay)"/>
+    <param name="startup_go_zero" value="$(arg startup_go_zero)"/>
   </node>
 </launch>

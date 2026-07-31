@@ -1,6 +1,16 @@
 # 机械臂识别、抓取、放置动作和固定关节姿态均在代码中严格沿用
-# juesai/grab2016_7_21.py。本配置只定义比赛轮次与七个车辆任务点。
+# juesai/grab2016_7_21.py。本配置定义启动回零、比赛轮次与七个车辆任务点。
 max_rounds: 2
+
+# 节点启动时先调用 /go_zero_srv，并等待 /joint_states_single 确认六个关节
+# 连续若干帧进入零位容差；完成前不会初始化相机，也不会开放任务订阅。
+startup_joint_state_topic: /joint_states_single
+go_zero_service: /go_zero_srv
+go_zero_is_mit_mode: false
+go_zero_service_timeout: 10.0
+go_zero_motion_timeout: 30.0
+go_zero_joint_tolerance: 0.05
+go_zero_stable_samples: 5
 
 # 车辆停靠航点与机械臂动作的固定映射：
 # 1=目标卡片，2~4=三个抓取候选位置，5~7=三个放置候选位置。
