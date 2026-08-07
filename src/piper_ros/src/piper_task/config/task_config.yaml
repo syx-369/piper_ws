@@ -2,6 +2,14 @@
 # juesai/grab2016_7_21.py。本配置定义启动回零、比赛轮次与七个车辆任务点。
 max_rounds: 2
 
+# 卡片已连续三帧确认后的结果展示/移卡时间。原脚本固定等待 10 秒。
+card_confirm_hold_time: 1.5
+
+# 机械臂视觉检测期间由 piper_task 自己发布标注图，避免另一个线程并发读取
+# RealSense。final_vision 订阅后在总控窗口显示，并把状态转到总控终端。
+detection_image_topic: /piper_task/detection_image
+detection_status_topic: /piper_task/detection_status
+
 # 节点启动时先调用 /go_zero_srv，并等待 /joint_states_single 确认六个关节
 # 连续若干帧进入零位容差；完成前不会初始化相机，也不会开放任务订阅。
 startup_joint_state_topic: /joint_states_single
@@ -11,6 +19,12 @@ go_zero_service_timeout: 10.0
 go_zero_motion_timeout: 30.0
 go_zero_joint_tolerance: 0.05
 go_zero_stable_samples: 5
+
+# 比赛中失败恢复的 stow 在固定等待8秒后，还会用实时关节反馈再次确认零位。
+# 未确认到位时不会允许车辆进入倒车恢复。
+runtime_joint_verify_timeout: 3.0
+runtime_joint_tolerance: 0.05
+runtime_joint_stable_samples: 3
 
 # 车辆停靠航点与机械臂动作的固定映射：
 # 1=目标卡片，2~4=三个抓取候选位置，5~7=三个放置候选位置。

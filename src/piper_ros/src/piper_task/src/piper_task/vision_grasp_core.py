@@ -11,7 +11,8 @@ import rospy
 import tf.transformations as tf_trans
 from geometry_msgs.msg import PoseStamped
 from piper_msgs.msg import PosCmd
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import Image, JointState
+from std_msgs.msg import String
 from ultralytics import YOLO
 
 # ===============================
@@ -48,8 +49,9 @@ MIN_STABLE_DETECTIONS = 3
 TRACK_MAX_PIXEL_DISTANCE = 60.0
 TRACK_MAX_DEPTH_DIFF = 0.15
 
-# 是否显示检测窗口。
-SHOW_DETECTION_WINDOW = True
+# 检测画面统一发布到 /piper_task/detection_image，由 final_vision 在
+# "Final Mission Vision" 窗口显示；这里不再创建第二个本地窗口。
+SHOW_DETECTION_WINDOW = False
 
 # bb6_300.pt 中的类别以及检测框显示颜色（OpenCV BGR）。
 CLASS_BGR = {
@@ -327,6 +329,31 @@ class PiperVisionController:
         self.current_ee_pose_mat = T_mat
         self.pose_received = True
 
+    def publish_detection_status(self, status):
+        """发布机械臂视觉阶段/结果，供 final_race 终端直接显示。"""
+        publisher = getattr(self, "detection_status_pub", None)
+        if publisher is not None:
+            publisher.publish(String(data=str(status)))
+
+    def publish_detection_image(self, image):
+        """发布当前检测标注图；相机仍只由本进程读取，不引入并发取帧。"""
+        publisher = getattr(self, "detection_image_pub", None)
+        if publisher is None or image is None:
+            return
+        image = np.ascontiguousarray(image)
+        if image.ndim != 3 or image.shape[2] != 3:
+            return
+        message = Image()
+        message.header.stamp = rospy.Time.now()
+        message.header.frame_id = "hand_cam"
+        message.height = image.shape[0]
+        message.width = image.shape[1]
+        message.encoding = "bgr8"
+        message.is_bigendian = 0
+        message.step = image.shape[1] * 3
+        message.data = image.tobytes()
+        publisher.publish(message)
+
     def init_camera_and_detector(self):
         if not os.path.exists(MODEL_PATH):
             rospy.logwarn(f"未在当前路径找到模型: {MODEL_PATH}。如果模型在别处，请修改 MODEL_PATH 为绝对路径。")
@@ -433,6 +460,7 @@ class PiperVisionController:
             ">>> 请将只包含一个目标物品的参考图片置于 RealSense 镜头前；"
             "正在识别图片中的物品类型和颜色..."
         )
+        self.publish_detection_status("card:start:recognizing_reference")
         stable_label = None
         stable_hits = 0
 
@@ -462,6 +490,8 @@ class PiperVisionController:
                 stable_label = None
                 stable_hits = 0
 
+            self.publish_detection_image(annotated)
+
             if SHOW_DETECTION_WINDOW:
                 try:
                     cv2.imshow("Reference Image Target", annotated)
@@ -470,6 +500,10 @@ class PiperVisionController:
                     pass
 
             if stable_label is not None and stable_hits >= REFERENCE_MIN_STABLE_DETECTIONS:
+                self.publish_detection_status(
+                    "card:success:label=%s:conf=%.2f:hits=%d"
+                    % (stable_label, conf, stable_hits)
+                )
                 rospy.loginfo(
                     f">>> 参考图片识别成功: {LABEL_DESCRIPTION[stable_label]} "
                     f"({stable_label}), conf={conf:.2f}, 连续命中={stable_hits}帧"
@@ -477,6 +511,7 @@ class PiperVisionController:
                 return stable_label
 
         rospy.logerr("未能稳定识别参考图片中的物品类型和颜色，任务终止")
+        self.publish_detection_status("card:failed:reference_not_recognized")
         return None
 
     @staticmethod
@@ -596,6 +631,11 @@ class PiperVisionController:
         )
         rospy.loginfo(
             f"正在尝试检测目标: {label_text}，推理置信度阈值: {predict_conf:.2f}"
+        )
+        detection_context = str(getattr(self, "detection_context", "object"))
+        self.publish_detection_status(
+            "%s:start:label=%s:conf_threshold=%.2f"
+            % (detection_context, label_text, predict_conf)
         )
 
         candidate_tracks = []
@@ -743,6 +783,7 @@ class PiperVisionController:
                             matched_track["conf"] = candidate["conf"]
 
             last_annotated = annotated
+            self.publish_detection_image(annotated)
             if SHOW_DETECTION_WINDOW:
                 try:
                     cv2.imshow("Object Detection For Grasp", annotated)
@@ -756,6 +797,16 @@ class PiperVisionController:
             ]
             if stable_tracks and _ >= 10:
                 c = max(stable_tracks, key=lambda track: (track["hits"], track["score"]))
+                self.publish_detection_status(
+                    "%s:success:label=%s:conf=%.2f:hits=%d:depth=%.3f"
+                    % (
+                        detection_context,
+                        c["label"],
+                        c["conf"],
+                        c["hits"],
+                        c["dist_m"],
+                    )
+                )
                 rospy.loginfo("========================================")
                 rospy.loginfo(
                     f"检测成功！目标类别: {c['label']}  conf={c['conf']:.2f}  "
@@ -787,6 +838,10 @@ class PiperVisionController:
                 pass
 
         max_hits = max((track["hits"] for track in candidate_tracks), default=0)
+        self.publish_detection_status(
+            "%s:failed:label=%s:max_hits=%d"
+            % (detection_context, label_text, max_hits)
+        )
         rospy.logwarn(
             f"超时：未稳定检测到目标: {label_text}，最大连续区域命中={max_hits}帧"
         )
@@ -929,8 +984,9 @@ class PiperVisionController:
         cmd_close.mode2 = 0
         self.pub.publish(cmd_close)
         time.sleep(2.0)
-        
-        # 5. 归位
+
+
+        # 6. 归位
         joint_msg = JointState()
         joint_msg.header.stamp = rospy.Time.now()
         joint_msg.name = [""]

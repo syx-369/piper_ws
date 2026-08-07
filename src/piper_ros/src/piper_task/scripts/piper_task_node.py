@@ -21,7 +21,7 @@ import tf.transformations as tf_trans
 from geometry_msgs.msg import PoseStamped
 from piper_msgs.msg import PosCmd
 from piper_msgs.srv import GoZero
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import String
 
 # ===== 改动 2026-07-30（1/3）：接入 final_mission 的相机按需中继 =====
@@ -82,6 +82,18 @@ class CompetitionVisionController(CameraRelayMixin, PiperVisionController):
 
         self.pub = rospy.Publisher("/pin_pos_cmd", PosCmd, queue_size=1)
         self.joint_pub = rospy.Publisher("/joint_states", JointState, queue_size=1)
+        self.detection_image_topic = rospy.get_param(
+            "~detection_image_topic", "/piper_task/detection_image"
+        )
+        self.detection_status_topic = rospy.get_param(
+            "~detection_status_topic", "/piper_task/detection_status"
+        )
+        self.detection_image_pub = rospy.Publisher(
+            self.detection_image_topic, Image, queue_size=1
+        )
+        self.detection_status_pub = rospy.Publisher(
+            self.detection_status_topic, String, queue_size=10
+        )
 
         self.current_ee_pose_mat = np.eye(4)
         self.pose_received = False
@@ -112,6 +124,11 @@ class CompetitionVisionController(CameraRelayMixin, PiperVisionController):
         # 改动 2026-07-30（2/3）：相机就绪后启动按需中继。
         # 必须在 init_camera_and_detector() 之后 —— 中继要用 self.pipeline。
         self.start_frame_relay()
+        rospy.loginfo(
+            "机械臂检测调试输出：image=%s status=%s",
+            self.detection_image_topic,
+            self.detection_status_topic,
+        )
 
     def startup_joint_callback(self, msg):
         if len(msg.position) < 6:
@@ -184,7 +201,8 @@ class CompetitionVisionController(CameraRelayMixin, PiperVisionController):
                             last_max_error,
                             stable_samples,
                         )
-                        self.startup_joint_sub.unregister()
+                        # 保留关节反馈订阅。比赛中的失败恢复会再次核验机械臂
+                        # 确实回到运输零位，不能只凭“命令已发送”就允许车辆倒车。
                         return
                 else:
                     stable_samples = 0
@@ -213,6 +231,7 @@ class CompetitionTaskNode:
         "card",
         "pick", "pick1", "pick2", "pick3",
         "place", "place1", "place2", "place3",
+        "prepare_pick_scan", "abort_round",
         "stow", "reset", "status", "continue",
     }
 
@@ -233,6 +252,9 @@ class CompetitionTaskNode:
         )
 
         self.max_rounds = int(rospy.get_param("~max_rounds", 2))
+        self.card_confirm_hold_time = max(
+            0.0, float(rospy.get_param("~card_confirm_hold_time", 1.5))
+        )
         self.vehicle_stop_actions = rospy.get_param("~vehicle_stop_actions", {})
 
         self.state_pub = rospy.Publisher(
@@ -256,6 +278,7 @@ class CompetitionTaskNode:
         self.busy = False
         self.selected_target_label = None
         self.carried_target_label = None
+        self.no_payload = False
         self.completed_rounds = 0
         self.navigation_skip_tasks = set()
 
@@ -274,7 +297,8 @@ class CompetitionTaskNode:
         self.publish_navigation_skip(())
         self.publish_state("idle")
         rospy.loginfo(
-            "piper_task ready: command topic=%s, commands=card/pick1-3/place1-3/stow/reset/status",
+            "piper_task ready: command topic=%s, "
+            "commands=card/pick1-3/place1-3/prepare_pick_scan/abort_round/stow/reset/status",
             self.command_topic,
         )
 
@@ -306,11 +330,12 @@ class CompetitionTaskNode:
             selected = self.selected_target_label or "none"
             carried = self.carried_target_label or "none"
             self.publish_result(
-                "status:busy=%s,selected=%s,carried=%s,rounds=%d/%d"
+                "status:busy=%s,selected=%s,carried=%s,no_payload=%s,rounds=%d/%d"
                 % (
                     self.busy,
                     selected,
                     carried,
+                    self.no_payload,
                     self.completed_rounds,
                     self.max_rounds,
                 )
@@ -387,7 +412,7 @@ class CompetitionTaskNode:
                 self.busy = False
                 # 改动 2026-07-30（3/3）：动作结束，允许中继继续取帧
                 self.arm.set_relay_paused(False)
-                self.publish_state("idle")
+                self.publish_state("idle:no_payload" if self.no_payload else "idle")
                 self.command_queue.task_done()
 
     def execute_command(self, command):
@@ -399,11 +424,16 @@ class CompetitionTaskNode:
         elif command in ("place", "place1", "place2", "place3"):
             candidate = 1 if command == "place" else int(command[-1])
             ok, reason = self.execute_place_candidate(candidate)
+        elif command == "prepare_pick_scan":
+            ok, reason = self.execute_prepare_pick_scan()
+        elif command == "abort_round":
+            ok, reason = self.execute_abort_round()
         elif command == "stow":
             ok, reason = self.execute_stow()
         elif command == "reset":
             self.selected_target_label = None
             self.carried_target_label = None
+            self.no_payload = False
             self.completed_rounds = 0
             self.publish_target("")
             self.publish_navigation_skip(())
@@ -429,6 +459,56 @@ class CompetitionTaskNode:
         self.arm.joint_pub.publish(msg)
         time.sleep(JOINT_MOVE_WAIT)
         return not rospy.is_shutdown()
+
+    def wait_joint_pose(self, positions):
+        """用真实关节反馈确认前六轴到达指定姿态。"""
+        timeout = max(
+            0.1, float(rospy.get_param("~runtime_joint_verify_timeout", 3.0))
+        )
+        tolerance = max(
+            0.001, float(rospy.get_param("~runtime_joint_tolerance", 0.05))
+        )
+        stable_required = max(
+            1, int(rospy.get_param("~runtime_joint_stable_samples", 3))
+        )
+        target = tuple(float(value) for value in positions[:6])
+        deadline = time.monotonic() + timeout
+        stable = 0
+        last_error = float("inf")
+        rate = rospy.Rate(20)
+
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            feedback = self.arm.startup_joint_positions
+            received_at = self.arm.startup_joint_received_at
+            fresh = (
+                feedback is not None
+                and received_at is not None
+                and time.monotonic() - received_at <= 1.0
+            )
+            if fresh:
+                last_error = max(
+                    abs(actual - desired)
+                    for actual, desired in zip(feedback[:6], target)
+                )
+                if last_error <= tolerance:
+                    stable += 1
+                    if stable >= stable_required:
+                        return True
+                else:
+                    stable = 0
+            rate.sleep()
+
+        rospy.logerr(
+            "关节姿态确认失败：最大误差=%s，要求 <= %.3frad 连续 %d 帧。",
+            (
+                "无有效反馈"
+                if not np.isfinite(last_error)
+                else "%.4frad" % last_error
+            ),
+            tolerance,
+            stable_required,
+        )
+        return False
 
     def close_gripper_at_current_pose(self):
         curr_pose = self.arm.current_ee_pose_mat.copy()
@@ -459,6 +539,7 @@ class CompetitionTaskNode:
             return False, "all_rounds_completed"
 
         self.selected_target_label = None
+        self.no_payload = False
         self.publish_target("")
         self.publish_navigation_skip(())
 
@@ -467,13 +548,15 @@ class CompetitionTaskNode:
             return False, "reference_scan_failed"
 
         self.publish_state("card:recognizing_reference")
+        self.arm.detection_context = "card"
         selected_label = self.arm.recognize_reference_target()
         target_type = self.arm.target_type_from_label(selected_label)
         if target_type is None:
             return False, "reference_not_recognized"
 
-        # 7_21 脚本在识别卡片后固定等待10秒，并在此锁定图片样式。
-        time.sleep(10.0)
+        # 识别结果已经连续三帧确认；短暂停留用于展示结果和移走卡片。
+        rospy.loginfo("卡片识别结果保持 %.1fs。", self.card_confirm_hold_time)
+        rospy.sleep(self.card_confirm_hold_time)
         self.selected_target_label = selected_label
         self.publish_target(selected_label)
 
@@ -502,6 +585,7 @@ class CompetitionTaskNode:
         )
 
         self.publish_state("pick%d:locating_object" % candidate)
+        self.arm.detection_context = "pick%d" % candidate
         T_base_object = self.arm.get_object_pose(target_type, selected_label)
         if T_base_object is None:
             if candidate < 3:
@@ -549,6 +633,7 @@ class CompetitionTaskNode:
         time.sleep(2.0)
 
         self.carried_target_label = selected_label
+        self.no_payload = False
         self.publish_target(selected_label)
         # 例如在第2个车辆点（candidate=1）抓取成功，则车辆点3、4无需停车。
         remaining_pick_stops = tuple(
@@ -562,6 +647,8 @@ class CompetitionTaskNode:
     def execute_place_candidate(self, candidate):
         if candidate not in (1, 2, 3):
             return False, "invalid_place_candidate"
+        if self.no_payload:
+            return True, "skip_no_payload"
         if self.carried_target_label is None:
             # 若已经在前面的放置候选点成功，后续候选点直接跳过。
             if self.selected_target_label is None:
@@ -582,6 +669,7 @@ class CompetitionTaskNode:
 
         # 与 7_21 脚本一致：只定位任务开始时锁定的物品类型+颜色图片。
         self.publish_state("place%d:locating_target" % candidate)
+        self.arm.detection_context = "place%d" % candidate
         T_base_place_image = self.arm.get_place_pose_by_image_style(target_label)
         if T_base_place_image is None:
             if candidate < 3:
@@ -609,6 +697,7 @@ class CompetitionTaskNode:
 
         self.carried_target_label = None
         self.selected_target_label = None
+        self.no_payload = False
         self.completed_rounds += 1
         self.publish_target("")
         # candidate=1 对应车辆点5；成功后点6、7无需停车。
@@ -619,10 +708,46 @@ class CompetitionTaskNode:
         self.publish_navigation_skip(remaining_place_stops)
         return True, "round=%d/%d" % (self.completed_rounds, self.max_rounds)
 
+    def execute_prepare_pick_scan(self):
+        """回退车辆已经停稳后，重新展开到取货观察姿态。"""
+        if self.carried_target_label is not None:
+            return False, "already_carrying=%s" % self.carried_target_label
+        if self.selected_target_label is None:
+            return False, "card_target_not_selected"
+        if self.no_payload:
+            return False, "round_already_aborted"
+
+        self.publish_state("recovery:moving_to_pick_scan")
+        if not self.move_joint_pose(PICK_SCAN_JOINTS):
+            return False, "pick_scan_failed"
+        if not self.wait_joint_pose(PICK_SCAN_JOINTS):
+            return False, "pick_scan_not_verified"
+        return True, "pick_scan_ready"
+
+    def execute_abort_round(self):
+        """抓取恢复也失败：收臂、标记空载并跳过本轮全部卸货动作。"""
+        self.publish_state("abort_round:moving_to_transport")
+        stowed, stow_reason = self.execute_stow()
+        if not stowed:
+            return False, "stow_failed_during_abort=%s" % stow_reason
+
+        self.carried_target_label = None
+        self.selected_target_label = None
+        self.no_payload = True
+        self.publish_target("")
+        # 车辆仍沿原路线经过卸货区，但三个卸货候选点都不再停车或动臂。
+        self.publish_navigation_skip(
+            ("piper_stop_5", "piper_stop_6", "piper_stop_7")
+        )
+        self.publish_state("no_payload")
+        return True, "no_payload"
+
     def execute_stow(self):
         if not self.move_joint_pose(TRANSPORT_JOINTS):
             return False, "stow_path_failed"
-        return True, "stowed"
+        if not self.wait_joint_pose(TRANSPORT_JOINTS):
+            return False, "stow_not_verified"
+        return True, "stowed_verified"
 
     def on_shutdown(self):
         try:
