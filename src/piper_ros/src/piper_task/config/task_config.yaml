@@ -10,6 +10,24 @@ card_confirm_hold_time: 1.5
 detection_image_topic: /piper_task/detection_image
 detection_status_topic: /piper_task/detection_status
 
+# 抓取时以下边距用于限制检测框中心；检测框可进入软边距，但与真实图像
+# 边界的距离不能小于 pick_hard_border_margin。这样目标完整可见时允许抓取，
+# x=0/x=639 等已经被裁切的目标仍会拒绝。放置仍要求整个框位于软边距内。
+object_edge_margin_x: 40
+object_edge_margin_y: 30
+pick_hard_border_margin: 8
+
+# 正常深度仍沿用原始检测框百分位算法；超出任务范围时才使用滤波帧恢复，
+# 并在当前车辆任务点继续采样，不会因为单帧异常立即驶向下一候选点。
+pick_depth_min: 0.25
+pick_depth_max: 0.70
+place_depth_min: 0.30
+place_depth_max: 0.70
+depth_retry_extra_frames: 45
+depth_stable_samples: 5
+depth_stability_max_spread: 0.03
+depth_fallback_min_valid_ratio: 0.05
+
 # 节点启动时先调用 /go_zero_srv，并等待 /joint_states_single 确认六个关节
 # 连续若干帧进入零位容差；完成前不会初始化相机，也不会开放任务订阅。
 startup_joint_state_topic: /joint_states_single

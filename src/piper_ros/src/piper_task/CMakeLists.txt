@@ -15,7 +15,10 @@ catkin_package()
 
 catkin_install_python(PROGRAMS
   scripts/arm_function_test_follower.py
+  scripts/pick_object_depth_ir_test.py
   scripts/piper_task_node.py
+  scripts/place_bottle_depth_ir_test.py
+  scripts/traffic_light_test.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

@@ -97,6 +97,7 @@ class CompetitionVisionController(CameraRelayMixin, PiperVisionController):
 
         self.current_ee_pose_mat = np.eye(4)
         self.pose_received = False
+        self.pose_received_at = None
         self.startup_joint_positions = None
         self.startup_joint_received_at = None
         rospy.Subscriber("/end_pose", PoseStamped, self.pose_callback)
@@ -129,6 +130,11 @@ class CompetitionVisionController(CameraRelayMixin, PiperVisionController):
             self.detection_image_topic,
             self.detection_status_topic,
         )
+
+    def pose_callback(self, msg):
+        """保存 /end_pose 实际反馈，并记录到达时间供运动日志判断新鲜度。"""
+        super().pose_callback(msg)
+        self.pose_received_at = time.monotonic()
 
     def startup_joint_callback(self, msg):
         if len(msg.position) < 6:
@@ -231,7 +237,7 @@ class CompetitionTaskNode:
         "card",
         "pick", "pick1", "pick2", "pick3",
         "place", "place1", "place2", "place3",
-        "prepare_pick_scan", "abort_round",
+        "prepare_pick_scan", "abort_round", "discard_place",
         "stow", "reset", "status", "continue",
     }
 
@@ -298,7 +304,8 @@ class CompetitionTaskNode:
         self.publish_state("idle")
         rospy.loginfo(
             "piper_task ready: command topic=%s, "
-            "commands=card/pick1-3/place1-3/prepare_pick_scan/abort_round/stow/reset/status",
+            "commands=card/pick1-3/place1-3/prepare_pick_scan/abort_round/"
+            "discard_place/stow/reset/status",
             self.command_topic,
         )
 
@@ -428,6 +435,8 @@ class CompetitionTaskNode:
             ok, reason = self.execute_prepare_pick_scan()
         elif command == "abort_round":
             ok, reason = self.execute_abort_round()
+        elif command == "discard_place":
+            ok, reason = self.execute_discard_place()
         elif command == "stow":
             ok, reason = self.execute_stow()
         elif command == "reset":
@@ -459,6 +468,46 @@ class CompetitionTaskNode:
         self.arm.joint_pub.publish(msg)
         time.sleep(JOINT_MOVE_WAIT)
         return not rospy.is_shutdown()
+
+    def log_pick_pose_target(self, stage, target_pose):
+        """记录即将发送给逆解节点的抓取末端目标。"""
+        target_xyz = target_pose[0:3, 3]
+        rospy.loginfo(
+            "抓取位姿[%s] 指令目标 EE XYZ: X=%.4f Y=%.4f Z=%.4f m",
+            stage,
+            target_xyz[0],
+            target_xyz[1],
+            target_xyz[2],
+        )
+
+    def log_pick_pose_feedback(self, stage, target_pose):
+        """将 /end_pose 实际反馈与本阶段抓取目标进行对比。"""
+        actual_pose = self.arm.current_ee_pose_mat.copy()
+        actual_xyz = actual_pose[0:3, 3]
+        target_xyz = target_pose[0:3, 3]
+        error_mm = (actual_xyz - target_xyz) * 1000.0
+        error_norm_mm = float(np.linalg.norm(error_mm))
+        received_at = getattr(self.arm, "pose_received_at", None)
+        feedback_age = (
+            float("inf")
+            if received_at is None
+            else max(0.0, time.monotonic() - received_at)
+        )
+        age_text = "未知" if not np.isfinite(feedback_age) else "%.3fs" % feedback_age
+        rospy.loginfo(
+            "抓取位姿[%s] 实际反馈 EE XYZ: X=%.4f Y=%.4f Z=%.4f m; "
+            "误差(实际-目标): dX=%+.1f dY=%+.1f dZ=%+.1f mm, 总误差=%.1f mm; "
+            "/end_pose反馈年龄=%s",
+            stage,
+            actual_xyz[0],
+            actual_xyz[1],
+            actual_xyz[2],
+            error_mm[0],
+            error_mm[1],
+            error_mm[2],
+            error_norm_mm,
+            age_text,
+        )
 
     def wait_joint_pose(self, positions):
         """用真实关节反馈确认前六轴到达指定姿态。"""
@@ -588,27 +637,46 @@ class CompetitionTaskNode:
         self.arm.detection_context = "pick%d" % candidate
         T_base_object = self.arm.get_object_pose(target_type, selected_label)
         if T_base_object is None:
+            vision_failure = str(
+                getattr(self.arm, "last_object_detection_failure", "not_found")
+                or "not_found"
+            )
+            if vision_failure.startswith("target_at_edge="):
+                edge_direction = vision_failure.split("=", 1)[1] or "unknown"
+                if candidate < 3:
+                    return True, "target_at_edge_%s_continue_to_pick%d" % (
+                        edge_direction,
+                        candidate + 1,
+                    )
+                return False, "target_at_edge_at_final_pick_point=%s" % (
+                    edge_direction
+                )
             if candidate < 3:
                 return True, "not_here_continue_to_pick%d" % (candidate + 1)
             return False, "object_not_found_at_all_pick_points"
 
-        # 以下偏移、速度、夹爪值和等待时间严格沿用原测试脚本。
+        # 抓取偏移沿用 grab2016_7_16_1.py 中已验证的实机参数。
         self.publish_state("pick%d:moving_to_pregrasp" % candidate)
         T_pre = T_OBJECT_TO_GRASP.copy()
-        T_pre[0:3, 3] = [-0.04, -0.02, -0.05]
+        T_pre[0:3, 3] = [-0.050, -0.01, -0.05]
         target_ee_pre = T_base_object @ T_pre @ T_EE_TO_TOOL
+        self.log_pick_pose_target("pregrasp", target_ee_pre)
         self.arm.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=100)
         time.sleep(3.5)
+        self.log_pick_pose_feedback("pregrasp", target_ee_pre)
 
         self.publish_state("pick%d:approaching" % candidate)
         T_approach = T_OBJECT_TO_GRASP.copy()
-        T_approach[0:3, 3] = [-0.04, -0.02, 0.06]
+        T_approach[0:3, 3] = [-0.050, -0.025, 0.065]
+        target_ee_approach = T_base_object @ T_approach @ T_EE_TO_TOOL
+        self.log_pick_pose_target("approach", target_ee_approach)
         self.arm.move_to_target_smooth(
-            T_base_object @ T_approach @ T_EE_TO_TOOL,
+            target_ee_approach,
             v=0.02,
             gripper_val=100,
         )
         time.sleep(2.5)
+        self.log_pick_pose_feedback("approach", target_ee_approach)
 
         self.publish_state("pick%d:closing_gripper" % candidate)
         self.close_gripper_at_current_pose()
@@ -616,7 +684,7 @@ class CompetitionTaskNode:
 
         self.publish_state("pick%d:lifting" % candidate)
         T_up = T_OBJECT_TO_GRASP.copy()
-        T_up[0:3, 3] = [-0.15, 0.0, 0.06]
+        T_up[0:3, 3] = [-0.15, 0.0, 0.04]
         self.arm.move_to_target_smooth(
             T_base_object @ T_up @ T_EE_TO_TOOL,
             v=0.05,
@@ -679,7 +747,7 @@ class CompetitionTaskNode:
         # 以下放置偏移、速度、夹爪值和等待时间严格沿用原测试脚本。
         self.publish_state("place%d:moving_to_release" % candidate)
         T_pre = T_OBJECT_TO_GRASP.copy()
-        T_pre[0:3, 3] = [-0.10, -0.04, -0.06]
+        T_pre[0:3, 3] = [-0.12, -0.04, -0.06]
         target_ee_pre = T_base_place_image @ T_pre @ T_EE_TO_TOOL
         self.arm.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=0)
         time.sleep(3.5)
@@ -687,6 +755,15 @@ class CompetitionTaskNode:
         self.publish_state("place%d:opening_gripper" % candidate)
         self.open_gripper_at_current_pose()
         time.sleep(2.0)
+
+        # 松开物品后先沿目标坐标系抬起，再回运输零位，避免直接归位时
+        # 机械臂横向扫过放置箱或目标卡片。
+        rospy.loginfo(">>> 抬起")
+        T_pre = T_OBJECT_TO_GRASP.copy()
+        T_pre[0:3, 3] = [-0.17, -0.04, -0.06]
+        target_ee_pre = T_base_place_image @ T_pre @ T_EE_TO_TOOL
+        self.arm.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=200)
+        time.sleep(3.5)
 
         self.publish_state("place%d:moving_to_stow" % candidate)
         if not self.move_joint_pose(TRANSPORT_JOINTS):
@@ -741,6 +818,43 @@ class CompetitionTaskNode:
         )
         self.publish_state("no_payload")
         return True, "no_payload"
+
+    def execute_discard_place(self):
+        """三个放置候选点均失败：松开物品，确认收臂后结束本轮。
+
+        carried_target_label 在张爪后立即清除，避免回零重试期间仍把已经丢弃的
+        物品当成在手。selected_target_label 则保留到回零确认成功，既标记本轮
+        尚未安全收尾，也保证重复执行本命令时不会重复累计 completed_rounds。
+        """
+        if self.carried_target_label is not None:
+            self.publish_state("discard_place:opening_gripper")
+            rospy.logwarn("三个放置候选点均失败：在第三点张开夹爪丢弃物品。")
+            self.open_gripper_at_current_pose()
+            time.sleep(2.0)
+            self.carried_target_label = None
+            self.publish_target("")
+
+        self.publish_state("discard_place:moving_to_transport")
+        stowed, stow_reason = self.execute_stow()
+        if not stowed:
+            return False, "stow_failed_after_discard=%s" % stow_reason
+
+        # 只有仍有本轮锁定目标时才累计一次。若回零失败后重发本命令，目标会
+        # 一直保留到本次成功，因此不会少计；成功后清空，也不会重复累计。
+        if self.selected_target_label is not None:
+            self.completed_rounds = min(
+                self.max_rounds, self.completed_rounds + 1
+            )
+        self.selected_target_label = None
+        self.no_payload = False
+        self.publish_target("")
+        # 清除上一阶段的跳点名单，保证下一轮任务点正常执行。
+        self.publish_navigation_skip(())
+        self.publish_state("idle")
+        return True, "discarded_and_stowed:round=%d/%d" % (
+            self.completed_rounds,
+            self.max_rounds,
+        )
 
     def execute_stow(self):
         if not self.move_joint_pose(TRANSPORT_JOINTS):

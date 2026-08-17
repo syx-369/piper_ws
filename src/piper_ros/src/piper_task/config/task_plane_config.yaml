@@ -1,0 +1,97 @@
+# 独立的新放置平面算法比赛配置。原 task_config.yaml 保持不变。
+
+# 以下比赛流程参数与当前正式节点保持一致。
+max_rounds: 2
+card_confirm_hold_time: 1.5
+
+detection_image_topic: /piper_task/detection_image
+detection_status_topic: /piper_task/detection_status
+
+object_edge_margin_x: 40
+object_edge_margin_y: 30
+pick_hard_border_margin: 8
+
+# 抓取仍使用原来的框内深度算法和参数。
+pick_depth_min: 0.25
+pick_depth_max: 0.70
+place_depth_min: 0.30
+place_depth_max: 0.70
+depth_retry_extra_frames: 45
+depth_stable_samples: 5
+depth_stability_max_spread: 0.03
+depth_fallback_min_valid_ratio: 0.05
+
+startup_joint_state_topic: /joint_states_single
+go_zero_service: /go_zero_srv
+go_zero_is_mit_mode: false
+go_zero_service_timeout: 10.0
+go_zero_motion_timeout: 30.0
+go_zero_joint_tolerance: 0.05
+go_zero_stable_samples: 5
+
+runtime_joint_verify_timeout: 3.0
+runtime_joint_tolerance: 0.05
+runtime_joint_stable_samples: 3
+
+vehicle_stop_actions:
+  piper_stop_1: card
+  piper_stop_2: pick1
+  piper_stop_3: pick2
+  piper_stop_4: pick3
+  piper_stop_5: place1
+  piper_stop_6: place2
+  piper_stop_7: place3
+
+# ===== 新放置平面算法专用参数 =====
+# 目标检测与连续稳定确认。放置允许一定误差，减少倾斜卡片和轻微抖动造成的
+# 深度拒绝；这些参数只供 piper_task_plane_node.py 使用，不影响原抓取流程。
+place_plane_conf_threshold: 0.50
+place_plane_red_conf_threshold: 0.20
+place_plane_image_size: 640
+place_plane_stable_samples: 4
+place_plane_max_depth_spread: 0.050
+place_plane_max_center_spread: 25.0
+place_plane_retry_extra_frames: 45
+# 允许有效平面帧之间夹杂短暂失败；超过该连续失败帧数才清空稳定样本。
+place_plane_max_invalid_gap_frames: 8
+
+# 四周平面连续不可用时，使用检测框中心小区域的稳定中位深度完成低精度放置。
+# 比赛优先保证能够放置：适度降低有效像素和稳定性要求，但仍保留
+# 0.30~0.70m 深度范围，防止明显错误深度直接进入机械臂运动。
+place_center_fallback_enabled: true
+place_center_fallback_after_rejects: 6
+place_center_fallback_roi_ratio: 0.40
+place_center_fallback_min_valid_ratio: 0.08
+place_center_fallback_min_valid_pixels: 20
+place_center_fallback_max_mad: 0.045
+place_center_fallback_stable_samples: 3
+place_center_fallback_max_depth_spread: 0.070
+
+# PlacePlaneEstimator 使用的任务深度范围和检测框四周采样区域。
+depth_min: 0.30
+depth_max: 0.70
+ring_pad_ratio_x: 0.35
+ring_pad_ratio_y: 0.25
+ring_min_pad_x: 12
+ring_min_pad_y: 10
+ring_max_pad_x: 55
+ring_max_pad_y: 45
+ring_gap: 2
+
+# 四个候选区域的有效性以及相邻平面一致性。
+min_patch_valid_ratio: 0.05
+min_patch_valid_pixels: 20
+max_patch_mad: 0.035
+patch_consistency: 0.080
+min_consistent_patches: 2
+patch_plane_consistency: 0.055
+
+# 三维 RANSAC 平面拟合质量门槛。
+max_plane_points: 2400
+ransac_iterations: 100
+plane_inlier_threshold: 0.015
+min_plane_inliers: 60
+min_plane_inlier_ratio: 0.45
+min_patch_plane_inliers: 10
+max_plane_rmse: 0.015
+min_abs_plane_normal_z: 0.45

@@ -17,7 +17,7 @@ from ultralytics import YOLO
 # ===============================
 # 目标检测参数
 # ===============================
-MODEL_PATH = "/home/user/piper_ws/src/realsense-D455-YOLOV5/weights/bb6_300.pt"
+MODEL_PATH = "/home/user/piper_ws/src/realsense-D455-YOLOV5/weights/bb_0813.pt"
 CONF_THRES = 0.5
 # 红色方块容易受反光和曝光影响，先用较低阈值保留候选框，
 # 再在下面通过 HSV 红色占比进行二次确认。
@@ -812,7 +812,7 @@ class PiperVisionController:
         #   +z = 基坐标系 +X 方向
         rospy.loginfo(">>> 移动到预抓取位")
         T_pre = T_OBJECT_TO_GRASP.copy()
-        T_pre[0:3, 3] = [0.02, -0.01, -0.05]
+        T_pre[0:3, 3] = [-0.05, -0.01, -0.05]
         target_ee_pre = T_base_object @ T_pre @ T_EE_TO_TOOL
         self.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=100)
         time.sleep(3.5)
@@ -821,7 +821,9 @@ class PiperVisionController:
         # 4a. 慢速靠近目标
         rospy.loginfo(">>> 前探夹爪")
         T_t2 = T_OBJECT_TO_GRASP.copy()
-        T_t2[0:3, 3] = [0.02, -0.01, 0.04]
+        # 最终夹持点向右补偿 15 mm，并沿前探方向向外回退 10 mm；
+        # x（垂直方向）保持不变。
+        T_t2[0:3, 3] = [-0.05, -0.025, 0.065]
         self.move_to_target_smooth(T_base_object @ T_t2 @ T_EE_TO_TOOL, v=0.02, gripper_val=100)
         time.sleep(2.5)
 

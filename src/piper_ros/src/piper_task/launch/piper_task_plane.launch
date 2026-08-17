@@ -1,0 +1,25 @@
+<launch>
+  <!-- 独立的新放置平面算法比赛节点。原 piper_task.launch 保持不变。 -->
+  <arg name="config" default="$(find piper_task)/config/task_plane_config.yaml"/>
+  <arg name="enable_camera_relay" default="false"/>
+  <arg name="startup_go_zero" default="true"/>
+
+  <!-- 继续使用 /piper_task 命名空间和原比赛话题，final_mission 无需修改。 -->
+  <rosparam file="$(arg config)" command="load" ns="piper_task"/>
+
+  <node pkg="piper_task"
+        type="piper_task_plane_node.py"
+        name="piper_task"
+        output="screen"
+        required="true">
+    <param name="command_topic" value="/piper_task/command"/>
+    <param name="state_topic" value="/piper_task/state"/>
+    <param name="result_topic" value="/piper_task/result"/>
+    <param name="target_topic" value="/piper_task/target"/>
+    <param name="waypoint_event_topic" value="/waypoint_task_event"/>
+    <param name="waypoint_done_topic" value="/waypoint_task_done"/>
+    <param name="navigation_skip_topic" value="/piper_task/navigation_skip"/>
+    <param name="enable_camera_relay" value="$(arg enable_camera_relay)"/>
+    <param name="startup_go_zero" value="$(arg startup_go_zero)"/>
+  </node>
+</launch>
