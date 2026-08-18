@@ -559,6 +559,25 @@ class CompetitionTaskNode:
         )
         return False
 
+    def is_joint_pose_reached(self, positions):
+        """当前新鲜关节反馈是否已在目标姿态容差内。"""
+        feedback = self.arm.startup_joint_positions
+        received_at = self.arm.startup_joint_received_at
+        if feedback is None or received_at is None:
+            return False
+        if time.monotonic() - received_at > 1.0:
+            return False
+
+        tolerance = max(
+            0.001, float(rospy.get_param("~runtime_joint_tolerance", 0.05))
+        )
+        target = tuple(float(value) for value in positions[:6])
+        error = max(
+            abs(actual - desired)
+            for actual, desired in zip(feedback[:6], target)
+        )
+        return error <= tolerance
+
     def close_gripper_at_current_pose(self):
         curr_pose = self.arm.current_ee_pose_mat.copy()
         roll, pitch, yaw = tf_trans.euler_from_matrix(curr_pose, axes="sxyz")
@@ -658,7 +677,9 @@ class CompetitionTaskNode:
         # 抓取偏移沿用 grab2016_7_16_1.py 中已验证的实机参数。
         self.publish_state("pick%d:moving_to_pregrasp" % candidate)
         T_pre = T_OBJECT_TO_GRASP.copy()
-        T_pre[0:3, 3] = [-0.050, -0.01, -0.05]
+        # 抓取时夹爪偏左，沿 -Y（向右）补偿 1 cm；预抓取位额外上抬 1 cm，
+        # 避免横向接近时蹭到桌面。+X 向下，因此 x 减小表示上抬。
+        T_pre[0:3, 3] = [-0.04, -0.03, -0.05]
         target_ee_pre = T_base_object @ T_pre @ T_EE_TO_TOOL
         self.log_pick_pose_target("pregrasp", target_ee_pre)
         self.arm.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=100)
@@ -667,7 +688,8 @@ class CompetitionTaskNode:
 
         self.publish_state("pick%d:approaching" % candidate)
         T_approach = T_OBJECT_TO_GRASP.copy()
-        T_approach[0:3, 3] = [-0.050, -0.025, 0.065]
+        # 最终夹取点向左（+Y）补偿 1 cm，并沿 +X 向下补偿 1 cm。
+        T_approach[0:3, 3] = [-0.02, -0.02, 0.06]
         target_ee_approach = T_base_object @ T_approach @ T_EE_TO_TOOL
         self.log_pick_pose_target("approach", target_ee_approach)
         self.arm.move_to_target_smooth(
@@ -744,10 +766,10 @@ class CompetitionTaskNode:
                 return True, "not_here_continue_to_place%d" % (candidate + 1)
             return False, "target_not_found_at_all_place_points"
 
-        # 以下放置偏移、速度、夹爪值和等待时间严格沿用原测试脚本。
+        # 放置时末端偏右，沿 +Y（向左）补偿 1 cm。
         self.publish_state("place%d:moving_to_release" % candidate)
         T_pre = T_OBJECT_TO_GRASP.copy()
-        T_pre[0:3, 3] = [-0.12, -0.04, -0.06]
+        T_pre[0:3, 3] = [-0.12, -0.03, -0.06]
         target_ee_pre = T_base_place_image @ T_pre @ T_EE_TO_TOOL
         self.arm.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=0)
         time.sleep(3.5)
@@ -760,7 +782,8 @@ class CompetitionTaskNode:
         # 机械臂横向扫过放置箱或目标卡片。
         rospy.loginfo(">>> 抬起")
         T_pre = T_OBJECT_TO_GRASP.copy()
-        T_pre[0:3, 3] = [-0.17, -0.04, -0.06]
+        # 保持与释放点相同的横向补偿后再抬起，避免横向扫过放置区。
+        T_pre[0:3, 3] = [-0.17, -0.03, -0.06]
         target_ee_pre = T_base_place_image @ T_pre @ T_EE_TO_TOOL
         self.arm.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=200)
         time.sleep(3.5)
@@ -795,6 +818,11 @@ class CompetitionTaskNode:
             return False, "round_already_aborted"
 
         self.publish_state("recovery:moving_to_pick_scan")
+        # 回退期间机械臂通常已保持在该观察位。若反馈确认已到位，直接放行，
+        # 避免每次恢复都重复执行 move_joint_pose() 的固定 8 秒等待。
+        if self.is_joint_pose_reached(PICK_SCAN_JOINTS):
+            rospy.loginfo("回退恢复：机械臂已在抓取观察位，跳过重复关节运动。")
+            return True, "pick_scan_already_ready"
         if not self.move_joint_pose(PICK_SCAN_JOINTS):
             return False, "pick_scan_failed"
         if not self.wait_joint_pose(PICK_SCAN_JOINTS):
