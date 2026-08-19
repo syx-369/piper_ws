@@ -120,7 +120,8 @@ T_EE_TO_CAM = np.array([
 
 T_CAM_SHIFT = np.array([
     [1,0,0,0],
-    [0,1,0,-0.01],
+    # OpenCV 相机坐标 Y 向下；支架累计上移 20 mm，因此沿相机 -Y 平移 0.02 m。
+    [0,1,0,-0.02],
     [0,0,1,0],
     [0,0,0,1]
 ])
@@ -817,6 +818,27 @@ class PiperVisionController:
             max_frames=max_frames,
         )
 
+    def get_any_place_pose(self, max_frames=90):
+        """寻找任意可安全放置的已知物体，并返回位姿和实际标签。
+
+        这是正确目标全部复查失败后的降级策略。检测仍完整复用放置场景的
+        边缘、深度和连续帧约束，只放宽类别/颜色必须与手中物品一致的要求。
+        """
+        first_budget = max(15, int(max_frames) // 2)
+        second_budget = max(15, int(max_frames) - first_budget)
+        for target_type, frame_budget in (
+            ("block", first_budget),
+            ("bottle", second_budget),
+        ):
+            pose = self.get_object_pose(
+                target_type,
+                target_label=None,
+                max_frames=frame_budget,
+            )
+            if pose is not None:
+                return pose, self.last_detected_object_label
+        return None, None
+
     def move_to_target_smooth(self, T_target, v=0.05, rate_hz=100, gripper_val=0):
         """平滑移动：位置线性插值 + 四元数球面插值。"""
         rate = rospy.Rate(rate_hz)
@@ -888,6 +910,7 @@ class PiperVisionController:
         # 调用方在返回 None 时读取该字段，区分“完全没看见”和“正确目标在边缘”。
         # 每次检测开始必须先清空，避免沿用上一个候选点的失败原因。
         self.last_object_detection_failure = "not_found"
+        self.last_detected_object_label = None
         if target_type not in VALID_TARGET_LABELS:
             rospy.logerr(f"不支持的目标类型: {target_type}，只能是 block 或 bottle")
             return None
@@ -1372,6 +1395,7 @@ class PiperVisionController:
                 )
                 rospy.loginfo("========================================")
                 self.last_object_detection_failure = None
+                self.last_detected_object_label = c["label"]
                 return c["T_base_object"]
 
         if last_annotated is not None and SHOW_DETECTION_WINDOW:

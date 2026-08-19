@@ -237,7 +237,8 @@ class CompetitionTaskNode:
         "card",
         "pick", "pick1", "pick2", "pick3",
         "place", "place1", "place2", "place3",
-        "prepare_pick_scan", "abort_round", "discard_place",
+        "prepare_pick_scan", "prepare_place_scan", "place_any",
+        "abort_round", "discard_place",
         "stow", "reset", "status", "continue",
     }
 
@@ -304,8 +305,9 @@ class CompetitionTaskNode:
         self.publish_state("idle")
         rospy.loginfo(
             "piper_task ready: command topic=%s, "
-            "commands=card/pick1-3/place1-3/prepare_pick_scan/abort_round/"
-            "discard_place/stow/reset/status",
+            "commands=card/pick1-3/place1-3/prepare_pick_scan/"
+            "prepare_place_scan/place_any/abort_round/discard_place/"
+            "stow/reset/status",
             self.command_topic,
         )
 
@@ -433,6 +435,10 @@ class CompetitionTaskNode:
             ok, reason = self.execute_place_candidate(candidate)
         elif command == "prepare_pick_scan":
             ok, reason = self.execute_prepare_pick_scan()
+        elif command == "prepare_place_scan":
+            ok, reason = self.execute_prepare_place_scan()
+        elif command == "place_any":
+            ok, reason = self.execute_place_any()
         elif command == "abort_round":
             ok, reason = self.execute_abort_round()
         elif command == "discard_place":
@@ -688,8 +694,8 @@ class CompetitionTaskNode:
 
         self.publish_state("pick%d:approaching" % candidate)
         T_approach = T_OBJECT_TO_GRASP.copy()
-        # 最终夹取点向左（+Y）补偿 1 cm，并沿 +X 向下补偿 1 cm。
-        T_approach[0:3, 3] = [-0.02, -0.02, 0.06]
+        # 最终夹取点向左（+Y）补偿 1 cm，并累计沿 +X 向下补偿 2 cm。
+        T_approach[0:3, 3] = [-0.01, -0.02, 0.06]
         target_ee_approach = T_base_object @ T_approach @ T_EE_TO_TOOL
         self.log_pick_pose_target("approach", target_ee_approach)
         self.arm.move_to_target_smooth(
@@ -766,15 +772,27 @@ class CompetitionTaskNode:
                 return True, "not_here_continue_to_place%d" % (candidate + 1)
             return False, "target_not_found_at_all_place_points"
 
+        return self.execute_place_at_pose(
+            T_base_place_image,
+            state_prefix="place%d" % candidate,
+            placed_on_label=target_label,
+            candidate=candidate,
+        )
+
+    def execute_place_at_pose(
+        self, T_base_place_image, state_prefix, placed_on_label, candidate=None
+    ):
+        """复用正常放置轨迹；candidate=None 表示任意目标降级放置。"""
+
         # 放置时末端偏右，沿 +Y（向左）补偿 1 cm。
-        self.publish_state("place%d:moving_to_release" % candidate)
+        self.publish_state("%s:moving_to_release" % state_prefix)
         T_pre = T_OBJECT_TO_GRASP.copy()
         T_pre[0:3, 3] = [-0.12, -0.03, -0.06]
         target_ee_pre = T_base_place_image @ T_pre @ T_EE_TO_TOOL
         self.arm.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=0)
         time.sleep(3.5)
 
-        self.publish_state("place%d:opening_gripper" % candidate)
+        self.publish_state("%s:opening_gripper" % state_prefix)
         self.open_gripper_at_current_pose()
         time.sleep(2.0)
 
@@ -788,7 +806,7 @@ class CompetitionTaskNode:
         self.arm.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=200)
         time.sleep(3.5)
 
-        self.publish_state("place%d:moving_to_stow" % candidate)
+        self.publish_state("%s:moving_to_stow" % state_prefix)
         if not self.move_joint_pose(TRANSPORT_JOINTS):
             # 物品已经放下，保留准确状态，防止误以为仍在持物。
             self.carried_target_label = None
@@ -800,13 +818,62 @@ class CompetitionTaskNode:
         self.no_payload = False
         self.completed_rounds += 1
         self.publish_target("")
-        # candidate=1 对应车辆点5；成功后点6、7无需停车。
-        remaining_place_stops = tuple(
-            "piper_stop_%d" % stop_number
-            for stop_number in range(candidate + 5, 8)
+        # 正常前进放置成功后跳过剩余候选点；回退降级放置发生在三个点均已
+        # 消费之后，不再发布历史点跳过名单。
+        remaining_place_stops = (
+            tuple(
+                "piper_stop_%d" % stop_number
+                for stop_number in range(candidate + 5, 8)
+            )
+            if candidate is not None
+            else ()
         )
         self.publish_navigation_skip(remaining_place_stops)
+        if candidate is None:
+            return True, "fallback_any:placed_on=%s:round=%d/%d" % (
+                placed_on_label or "unknown",
+                self.completed_rounds,
+                self.max_rounds,
+            )
         return True, "round=%d/%d" % (self.completed_rounds, self.max_rounds)
+
+    def execute_prepare_place_scan(self):
+        """放置回退前/到点后确认机械臂保持持物观察姿态。"""
+        if self.no_payload or self.carried_target_label is None:
+            return False, "place_recovery_without_payload"
+
+        self.publish_state("place_recovery:moving_to_scan")
+        if self.is_joint_pose_reached(PLACE_SCAN_JOINTS):
+            rospy.loginfo("放置回退：机械臂已在放置观察位，跳过重复关节运动。")
+            return True, "place_scan_already_ready"
+        if not self.move_joint_pose(PLACE_SCAN_JOINTS):
+            return False, "place_scan_failed"
+        if not self.wait_joint_pose(PLACE_SCAN_JOINTS):
+            return False, "place_scan_not_verified"
+        return True, "place_scan_ready"
+
+    def execute_place_any(self):
+        """正确目标全部失败后，放到任意稳定且具备安全位姿的已知物体处。"""
+        if self.no_payload or self.carried_target_label is None:
+            return False, "fallback_any_without_payload"
+
+        self.publish_state("place_any:locating_safe_object")
+        self.arm.detection_context = "place_any"
+        T_base_place, detected_label = self.arm.get_any_place_pose()
+        if T_base_place is None:
+            return False, "no_safe_fallback_object"
+
+        rospy.logwarn(
+            "正确目标复查失败：手持 %s，降级放置到 %s。",
+            self.carried_target_label,
+            detected_label or "unknown",
+        )
+        return self.execute_place_at_pose(
+            T_base_place,
+            state_prefix="place_any",
+            placed_on_label=detected_label,
+            candidate=None,
+        )
 
     def execute_prepare_pick_scan(self):
         """回退车辆已经停稳后，重新展开到取货观察姿态。"""
