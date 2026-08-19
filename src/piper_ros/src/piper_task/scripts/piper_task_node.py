@@ -68,7 +68,7 @@ from piper_task.vision_grasp_core import (
 PICK_SCAN_JOINTS = [-1.530, 0.446, 0.0, 0.0, -0.115, 0.0, 0.0]
 TRANSPORT_JOINTS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 PLACE_SCAN_JOINTS = [-1.602, 0.641, -0.509, 0.0, 0.324, 0.0, 0.0]
-JOINT_MOVE_WAIT = 8.0
+JOINT_MOVE_WAIT_BASE = 8.0
 
 
 # 改动 2026-07-30（2/3）：混入 CameraRelayMixin（原为 PiperVisionController 单继承）
@@ -262,6 +262,17 @@ class CompetitionTaskNode:
         self.card_confirm_hold_time = max(
             0.0, float(rospy.get_param("~card_confirm_hold_time", 1.5))
         )
+        # 比赛动作节拍可在 task_config.yaml 中继续调整。限制最大倍率，避免
+        # 配置笔误使笛卡尔插值或延迟进入不安全范围。
+        self.cartesian_speed_scale = min(
+            2.0, max(0.25, float(rospy.get_param("~cartesian_speed_scale", 1.5)))
+        )
+        self.joint_speed_percent = min(
+            100.0, max(1.0, float(rospy.get_param("~joint_speed_percent", 20.0)))
+        )
+        self.motion_delay_scale = min(
+            2.0, max(0.25, float(rospy.get_param("~motion_delay_scale", 0.6)))
+        )
         self.vehicle_stop_actions = rospy.get_param("~vehicle_stop_actions", {})
 
         self.state_pub = rospy.Publisher(
@@ -303,6 +314,15 @@ class CompetitionTaskNode:
         self.publish_target("")
         self.publish_navigation_skip(())
         self.publish_state("idle")
+        rospy.loginfo(
+            "机械臂节拍：笛卡尔速度×%.2f，关节速度=%.0f%%，动作等待×%.2f "
+            "（关节姿态固定等待 %.1fs→%.1fs）",
+            self.cartesian_speed_scale,
+            self.joint_speed_percent,
+            self.motion_delay_scale,
+            JOINT_MOVE_WAIT_BASE,
+            JOINT_MOVE_WAIT_BASE * self.motion_delay_scale,
+        )
         rospy.loginfo(
             "piper_task ready: command topic=%s, "
             "commands=card/pick1-3/place1-3/prepare_pick_scan/"
@@ -463,16 +483,34 @@ class CompetitionTaskNode:
         self.publish_result("%s:%s:%s" % (prefix, command, reason))
         return ok
 
+    def scaled_cartesian_speed(self, base_speed):
+        """按比赛配置提高笛卡尔插值速度。"""
+        return float(base_speed) * self.cartesian_speed_scale
+
+    def wait_after_motion(self, base_seconds):
+        """按比赛配置缩短运动、夹爪动作后的稳定等待。"""
+        duration = max(0.0, float(base_seconds) * self.motion_delay_scale)
+        if duration > 0.0:
+            rospy.sleep(duration)
+
     def move_joint_pose(self, positions):
-        """发送原测试脚本格式的单个关节姿态并等待8秒。"""
+        """发送固定关节姿态，并按加速后的节拍等待。"""
         msg = JointState()
         msg.header.stamp = rospy.Time.now()
         msg.name = [""]
         msg.position = list(positions)
-        msg.velocity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0]
+        msg.velocity = [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            self.joint_speed_percent,
+        ]
         msg.effort = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5]
         self.arm.joint_pub.publish(msg)
-        time.sleep(JOINT_MOVE_WAIT)
+        self.wait_after_motion(JOINT_MOVE_WAIT_BASE)
         return not rospy.is_shutdown()
 
     def log_pick_pose_target(self, stage, target_pose):
@@ -688,8 +726,12 @@ class CompetitionTaskNode:
         T_pre[0:3, 3] = [-0.04, -0.03, -0.05]
         target_ee_pre = T_base_object @ T_pre @ T_EE_TO_TOOL
         self.log_pick_pose_target("pregrasp", target_ee_pre)
-        self.arm.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=100)
-        time.sleep(3.5)
+        self.arm.move_to_target_smooth(
+            target_ee_pre,
+            v=self.scaled_cartesian_speed(0.06),
+            gripper_val=100,
+        )
+        self.wait_after_motion(3.5)
         self.log_pick_pose_feedback("pregrasp", target_ee_pre)
 
         self.publish_state("pick%d:approaching" % candidate)
@@ -700,33 +742,33 @@ class CompetitionTaskNode:
         self.log_pick_pose_target("approach", target_ee_approach)
         self.arm.move_to_target_smooth(
             target_ee_approach,
-            v=0.02,
+            v=self.scaled_cartesian_speed(0.02),
             gripper_val=100,
         )
-        time.sleep(2.5)
+        self.wait_after_motion(2.5)
         self.log_pick_pose_feedback("approach", target_ee_approach)
 
         self.publish_state("pick%d:closing_gripper" % candidate)
         self.close_gripper_at_current_pose()
-        time.sleep(2.0)
+        self.wait_after_motion(2.0)
 
         self.publish_state("pick%d:lifting" % candidate)
         T_up = T_OBJECT_TO_GRASP.copy()
         T_up[0:3, 3] = [-0.15, 0.0, 0.04]
         self.arm.move_to_target_smooth(
             T_base_object @ T_up @ T_EE_TO_TOOL,
-            v=0.05,
+            v=self.scaled_cartesian_speed(0.05),
             gripper_val=0,
         )
-        time.sleep(3.0)
+        self.wait_after_motion(3.0)
 
         self.publish_state("pick%d:moving_to_transport" % candidate)
         if not self.move_joint_pose(TRANSPORT_JOINTS):
             return False, "transport_path_failed_after_grasp"
 
-        # 7_21 连续测试在抓取归位后额外等待2秒，再进入放置阶段。
-        # 七点功能测试随后虽会行车，仍保留该机械臂流程等待时间。
-        time.sleep(2.0)
+        # 7_21 连续测试在抓取归位后原本额外等待 2 秒；七点功能测试随后虽会
+        # 行车，仍保留这段等待，但按 motion_delay_scale 缩短。
+        self.wait_after_motion(2.0)
 
         self.carried_target_label = selected_label
         self.no_payload = False
@@ -789,12 +831,16 @@ class CompetitionTaskNode:
         T_pre = T_OBJECT_TO_GRASP.copy()
         T_pre[0:3, 3] = [-0.12, -0.03, -0.06]
         target_ee_pre = T_base_place_image @ T_pre @ T_EE_TO_TOOL
-        self.arm.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=0)
-        time.sleep(3.5)
+        self.arm.move_to_target_smooth(
+            target_ee_pre,
+            v=self.scaled_cartesian_speed(0.06),
+            gripper_val=0,
+        )
+        self.wait_after_motion(3.5)
 
         self.publish_state("%s:opening_gripper" % state_prefix)
         self.open_gripper_at_current_pose()
-        time.sleep(2.0)
+        self.wait_after_motion(2.0)
 
         # 松开物品后先沿目标坐标系抬起，再回运输零位，避免直接归位时
         # 机械臂横向扫过放置箱或目标卡片。
@@ -803,8 +849,12 @@ class CompetitionTaskNode:
         # 保持与释放点相同的横向补偿后再抬起，避免横向扫过放置区。
         T_pre[0:3, 3] = [-0.17, -0.03, -0.06]
         target_ee_pre = T_base_place_image @ T_pre @ T_EE_TO_TOOL
-        self.arm.move_to_target_smooth(target_ee_pre, v=0.06, gripper_val=200)
-        time.sleep(3.5)
+        self.arm.move_to_target_smooth(
+            target_ee_pre,
+            v=self.scaled_cartesian_speed(0.06),
+            gripper_val=200,
+        )
+        self.wait_after_motion(3.5)
 
         self.publish_state("%s:moving_to_stow" % state_prefix)
         if not self.move_joint_pose(TRANSPORT_JOINTS):
@@ -886,7 +936,7 @@ class CompetitionTaskNode:
 
         self.publish_state("recovery:moving_to_pick_scan")
         # 回退期间机械臂通常已保持在该观察位。若反馈确认已到位，直接放行，
-        # 避免每次恢复都重复执行 move_joint_pose() 的固定 8 秒等待。
+        # 避免每次恢复都重复执行 move_joint_pose() 的缩放后固定等待。
         if self.is_joint_pose_reached(PICK_SCAN_JOINTS):
             rospy.loginfo("回退恢复：机械臂已在抓取观察位，跳过重复关节运动。")
             return True, "pick_scan_already_ready"
@@ -925,7 +975,7 @@ class CompetitionTaskNode:
             self.publish_state("discard_place:opening_gripper")
             rospy.logwarn("三个放置候选点均失败：在第三点张开夹爪丢弃物品。")
             self.open_gripper_at_current_pose()
-            time.sleep(2.0)
+            self.wait_after_motion(2.0)
             self.carried_target_label = None
             self.publish_target("")
 

@@ -5,6 +5,14 @@ max_rounds: 2
 # 卡片已连续三帧确认后的结果展示/移卡时间。原脚本固定等待 10 秒。
 card_confirm_hold_time: 1.5
 
+# 比赛机械臂动作节拍。笛卡尔速度在原实测值上统一提高到 1.5 倍；固定关节
+# 姿态的驱动速度由原来的 10% 提高到 20%；运动及夹爪动作后的稳定等待缩短
+# 到原来的 60%（例如关节姿态等待由 8.0 秒变为 4.8 秒）。
+# 首次实机验证请保持急停可用并先空载运行；代码会将笛卡尔倍率限制在 2.0 以内。
+cartesian_speed_scale: 1.5
+joint_speed_percent: 20.0
+motion_delay_scale: 0.6
+
 # 机械臂视觉检测期间由 piper_task 自己发布标注图，避免另一个线程并发读取
 # RealSense。final_vision 订阅后在总控窗口显示，并把状态转到总控终端。
 detection_image_topic: /piper_task/detection_image
@@ -38,7 +46,7 @@ go_zero_motion_timeout: 30.0
 go_zero_joint_tolerance: 0.05
 go_zero_stable_samples: 5
 
-# 比赛中失败恢复的 stow 在固定等待8秒后，还会用实时关节反馈再次确认零位。
+# 比赛中失败恢复的 stow 在缩放后固定等待结束，还会用实时关节反馈确认零位。
 # 未确认到位时不会允许车辆进入倒车恢复。
 runtime_joint_verify_timeout: 3.0
 runtime_joint_tolerance: 0.05
