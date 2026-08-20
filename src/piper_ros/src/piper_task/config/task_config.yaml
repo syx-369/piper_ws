@@ -11,6 +11,10 @@ card_confirm_hold_time: 1.5
 # 首次实机验证请保持急停可用并先空载运行；代码会将笛卡尔倍率限制在 2.0 以内。
 cartesian_speed_scale: 1.5
 joint_speed_percent: 20.0
+# 从运输零位展开到抓取/放置观察位时使用更高的关节速度。
+observation_joint_speed_percent: 30.0
+# 放置松爪后回运输位也使用更高速度；其他回零动作仍使用上面的 20%。
+place_stow_joint_speed_percent: 30.0
 motion_delay_scale: 0.6
 
 # 机械臂视觉检测期间由 piper_task 自己发布标注图，避免另一个线程并发读取
