@@ -832,7 +832,7 @@ class CompetitionTaskNode:
         # 放置时末端偏右，沿 +Y（向左）补偿 1 cm。
         self.publish_state("%s:moving_to_release" % state_prefix)
         T_pre = T_OBJECT_TO_GRASP.copy()
-        T_pre[0:3, 3] = [-0.12, -0.03, -0.06]
+        T_pre[0:3, 3] = [-0.12, -0.04, -0.06]
         target_ee_pre = T_base_place_image @ T_pre @ T_EE_TO_TOOL
         self.arm.move_to_target_smooth(
             target_ee_pre,
