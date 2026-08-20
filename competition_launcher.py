@@ -3,9 +3,11 @@
 """比赛启动器：在独立终端启动 ROS 服务，并显示启动状态。"""
 
 import base64
+import csv
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -36,7 +38,7 @@ ITEMS = [
     LaunchItem("6. 机械臂任务节点", "source /opt/ros/noetic/setup.bash && source /home/user/miniconda3/etc/profile.d/conda.sh && conda activate piper && source /home/user/fastlio_ws/devel/setup.bash && source /home/user/piper_ws/devel/setup.bash && roslaunch piper_task piper_task.launch enable_camera_relay:=true"),
     LaunchItem("7. MID360 雷达", "cd ~/livox_ws && source devel/setup.bash && roslaunch livox_ros_driver2 msg_MID360.launch"),
     LaunchItem("8. S-FAST_LIO 重定位", "cd ~/fastlio_ws && source devel/setup.bash && source ~/livox_ws/devel/setup.bash --extend && roslaunch sfast_lio mapping_mid360_relocalization.launch rviz:=true"),
-    LaunchItem("9. 比赛总控", "source /opt/ros/noetic/setup.bash && source /home/user/fastlio_ws/devel/setup.bash && RACE_CSV=/home/user/fastlio_ws/src/waypoint_tools/data/final02.csv && CRUISE_SPEED={speed} && roslaunch final_mission final_race.launch csv_path:=${RACE_CSV} target_speed:=${CRUISE_SPEED} wait_for_start:=true auto_start:=false enable_vision:=true show_image:=true"),
+    LaunchItem("9. 比赛总控", "source /opt/ros/noetic/setup.bash && source /home/user/fastlio_ws/devel/setup.bash && RACE_CSV=/home/user/fastlio_ws/src/waypoint_tools/data/{route} && CRUISE_SPEED={speed} && roslaunch final_mission final_race.launch csv_path:=${RACE_CSV} target_speed:=${CRUISE_SPEED} wait_for_start:=true auto_start:=false enable_vision:=true show_image:=true"),
 ]
 
 
@@ -109,6 +111,11 @@ class Launcher(QMainWindow):
         self.speed_input.setSuffix(" m/s")
         self.speed_input.setToolTip("仅用于第 9 项“比赛总控”的 target_speed")
         speed_row.addWidget(self.speed_input)
+        speed_row.addWidget(QLabel("路径文件："))
+        self.race_file_input = QLineEdit("final03.csv")
+        self.race_file_input.setPlaceholderText("例如 final03.csv")
+        self.race_file_input.setToolTip("第 9 项总控使用的 CSV，位于 waypoint_tools/data/")
+        speed_row.addWidget(self.race_file_input)
         layout.addLayout(speed_row)
         grid = QGridLayout()
         for i, item in enumerate(ITEMS):
@@ -155,8 +162,8 @@ class Launcher(QMainWindow):
 
         file_row = QHBoxLayout()
         file_row.addWidget(QLabel("保存航迹文件名："))
-        self.route_file_input = QLineEdit("final02.csv")
-        self.route_file_input.setPlaceholderText("例如 final02.csv")
+        self.route_file_input = QLineEdit("final03.csv")
+        self.route_file_input.setPlaceholderText("例如 final03.csv")
         self.route_file_input.setToolTip("文件会保存到 ~/fastlio_ws/src/waypoint_tools/data/")
         file_row.addWidget(self.route_file_input)
         layout.addLayout(file_row)
@@ -178,10 +185,8 @@ class Launcher(QMainWindow):
             ("点7：第三个放置识别位置", lambda: self.publish_waypoint_task("piper_stop_7")),
             ("记录避障区起点", lambda: self.publish_waypoint_task("avoid_start", external=False)),
             ("记录避障区终点", lambda: self.publish_waypoint_task("avoid_end", external=False)),
-            ("检查任务点", lambda: self.run_route_check("检查任务点", "grep -n 'piper_stop'")),
-            ("检查轨迹最后十行", lambda: self.run_route_check("检查轨迹最后十行", "tail -n 10")),
-            ("统计任务点数量", lambda: self.run_route_check("统计任务点数量", "grep -c 'piper_stop'")),
-            ("校验比赛路线（2圈）", self.validate_route),
+            ("设置最后点为终点", self.set_last_waypoint_as_finish),
+            ("一键地图轨迹检查", self.plot_route_on_map),
         ]
         grid = QGridLayout()
         for i, (name, callback) in enumerate(commands):
@@ -209,6 +214,14 @@ class Launcher(QMainWindow):
             return None
         return filename if filename.endswith(".csv") else filename + ".csv"
 
+    def race_file_name(self, show_error=False):
+        filename = self.race_file_input.text().strip()
+        if not filename or filename != Path(filename).name or filename in (".", ".."):
+            if show_error:
+                QMessageBox.warning(self, "路径文件名无效", "请输入 CSV 文件名，例如 final03.csv；不要包含路径。")
+            return None
+        return filename if filename.endswith(".csv") else filename + ".csv"
+
     def record_waypoints(self):
         filename = self.selected_route_file()
         if not filename:
@@ -225,18 +238,38 @@ class Launcher(QMainWindow):
         command = "source /opt/ros/noetic/setup.bash && source /home/user/miniconda3/etc/profile.d/conda.sh && conda activate piper && source /home/user/piper_ws/devel/setup.bash && " + ros_command
         self.run_debug_command(name, command)
 
-    def run_route_check(self, name, prefix):
-        filename = self.selected_route_file()
-        if filename:
-            self.run_debug_command(name, prefix + " " + shlex.quote("/home/user/fastlio_ws/src/waypoint_tools/data/" + filename))
-
-    def validate_route(self):
+    def plot_route_on_map(self):
         filename = self.selected_route_file()
         if not filename:
             return
         route = shlex.quote("/home/user/fastlio_ws/src/waypoint_tools/data/" + filename)
-        command = "source /opt/ros/noetic/setup.bash && source /home/user/fastlio_ws/devel/setup.bash && rosrun final_mission validate_route.py %s --rounds 2" % route
-        self.run_debug_command("校验比赛路线（2圈）", command)
+        command = "python3 /home/user/piper_ws/plot_route_on_map.py %s" % route
+        self.run_debug_command("一键地图轨迹检查", command)
+
+    def set_last_waypoint_as_finish(self):
+        filename = self.selected_route_file()
+        if not filename:
+            return
+        route = Path("/home/user/fastlio_ws/src/waypoint_tools/data") / filename
+        try:
+            with route.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                fields, rows = reader.fieldnames, list(reader)
+            if not fields or "task" not in fields or not rows:
+                raise ValueError("CSV 为空或缺少 task 列")
+            backup = route.with_suffix(route.suffix + ".before_finish.bak")
+            if not backup.exists():
+                shutil.copy2(route, backup)
+            rows[-1]["task"] = "ext:finish"
+            with route.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "设置终点失败", str(error))
+            return
+        self.debug_message.setText("已将 %s 的最后点设置为 ext:finish；备份：%s" % (filename, backup.name))
+        QMessageBox.information(self, "终点已设置", "最后一个航点已标记为 ext:finish。")
 
     def run_debug_command(self, name, command):
         """调试命令使用独立终端，结束后保留 shell 供查看输出。"""
@@ -249,6 +282,8 @@ class Launcher(QMainWindow):
             QMessageBox.critical(self, "无法启动终端", "未找到 gnome-terminal。")
 
     def start_one(self, index):
+        if index == 8 and not self.race_file_name(show_error=True):
+            return False
         if not self.ensure_terminal_tabs():
             return False
         status_file = self.status_files[index]
@@ -267,7 +302,7 @@ class Launcher(QMainWindow):
         # "-- 命令 --tab ..."：那个 -- 会终止 gnome-terminal 的选项解析。
         args = ["gnome-terminal"]
         for i, item in enumerate(ITEMS):
-            command = item.command.replace("{speed}", "%.2f" % self.speed_input.value())
+            command = item.command.replace("{speed}", "%.2f" % self.speed_input.value()).replace("{route}", self.race_file_name() or "final03.csv")
             runner_args = ["python3", "-c", script, str(self.status_files[i]), base64.b64encode(command.encode()).decode(), "1" if item.persistent else "0", "1" if item.accept_successful_exit else "0", str(self.gate_files[i])]
             args.extend(["--title=比赛启动终端", "--window" if i == 0 else "--tab", "--command=" + shlex.join(runner_args)])
         try:
