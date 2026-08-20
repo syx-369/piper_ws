@@ -41,7 +41,7 @@ append_default_ros_arg("initial_mode", "light")
 append_default_ros_arg("show_image", "true")
 append_default_ros_arg(
     "traffic_weights",
-    "/home/user/fastlio_ws/src/waypoint_tools/config/traffic_light.pt",
+    "/home/user/fastlio_ws/src/waypoint_tools/config/tl_0820.pt",
 )
 
 try:

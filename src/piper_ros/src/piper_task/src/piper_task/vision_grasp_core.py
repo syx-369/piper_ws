@@ -23,7 +23,7 @@ MODEL_PATH = os.path.join(
     rospkg.RosPack().get_path("piper_task"),
     "config",
     "weights",
-    "bb_0816.pt",
+    "bb_0821.pt",
 )
 CONF_THRES = 0.5
 # 红色方块容易受反光和曝光影响，先用较低阈值保留候选框，
@@ -75,7 +75,7 @@ TRACK_MAX_DEPTH_DIFF = 0.15
 # "Final Mission Vision" 窗口显示；这里不再创建第二个本地窗口。
 SHOW_DETECTION_WINDOW = False
 
-# bb_0816.pt 中的类别以及检测框显示颜色（OpenCV BGR）。
+# bb_0821.pt 中的类别以及检测框显示颜色（OpenCV BGR）。
 CLASS_BGR = {
     "block-r": (0, 0, 255),
     "block-y": (0, 255, 255),
