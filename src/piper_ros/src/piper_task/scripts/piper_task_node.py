@@ -842,20 +842,7 @@ class CompetitionTaskNode:
         self.open_gripper_at_current_pose()
         self.wait_after_motion(2.0)
 
-        # 松开物品后先沿目标坐标系抬起，再回运输零位，避免直接归位时
-        # 机械臂横向扫过放置箱或目标卡片。
-        rospy.loginfo(">>> 抬起")
-        T_pre = T_OBJECT_TO_GRASP.copy()
-        # 保持与释放点相同的横向补偿后再抬起，避免横向扫过放置区。
-        T_pre[0:3, 3] = [-0.17, -0.03, -0.06]
-        target_ee_pre = T_base_place_image @ T_pre @ T_EE_TO_TOOL
-        self.arm.move_to_target_smooth(
-            target_ee_pre,
-            v=self.scaled_cartesian_speed(0.06),
-            gripper_val=200,
-        )
-        self.wait_after_motion(3.5)
-
+        # 松开物品后不再执行额外上抬，直接回运输姿态。
         self.publish_state("%s:moving_to_stow" % state_prefix)
         if not self.move_joint_pose(TRANSPORT_JOINTS):
             # 物品已经放下，保留准确状态，防止误以为仍在持物。
