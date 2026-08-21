@@ -5,6 +5,7 @@
 import base64
 import csv
 import json
+import math
 import os
 import shlex
 import shutil
@@ -15,11 +16,114 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PyQt5.QtCore import QTimer
-from PyQt5.QtWidgets import QApplication, QCheckBox, QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QApplication, QCheckBox, QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QStackedWidget, QVBoxLayout, QWidget
 
 
 STATUS_DIR = Path("/tmp/competition_launcher_status")
 STARTUP_GRACE_SECONDS = 5
+# 避障区实测起始位姿：车辆停在该位置、朝向附近后可直接启动重定位。
+# CSV 仅用于生成 avoid_start..avoid_end 的短测试路线，不参与重定位初值。
+AVOIDANCE_TEST_INITIAL_POS = (2.406303099617625, -26.38992998139038, -0.16290923251009404)
+AVOIDANCE_TEST_INITIAL_ROT = (-0.007025715288537381, 0.007590029144768787, 0.7048832757145482, 0.7092479103953668)
+
+# 仅用于独立避障测试的完整可覆盖参数集合。未写在这里的任务/机械臂参数不会影响
+# 这条没有 ext 任务的短路线。每次启动都会生成临时 YAML，绝不改比赛配置文件。
+AVOIDANCE_TEST_PARAM_TEMPLATE = """# 每行格式：参数名: 值。# 开头的行是注释。
+# 速度与跟踪
+max_linear: 1.00
+max_angular: 0.80
+max_linear_accel: 0.25
+max_linear_decel: 1.00
+max_angular_accel: 0.60
+min_tracking_speed: 0.08
+control_rate: 20.0
+lookahead_distance: 0.80
+min_lookahead: 0.60
+max_lookahead: 1.80
+lookahead_speed_ratio: 1.80
+execute_points: 7
+reference_horizon: 6.0
+reference_spacing: 0.15
+reference_smoothing_window: 7
+heading_slow_angle: 0.35
+heading_hard_slow_angle: 0.55
+rotate_in_place_angle: 0.70
+rotate_k_angular: 1.20
+final_approach_dist: 0.80
+goal_tolerance_default: 0.30
+# A* 规划与车体模型
+planner_enabled: true
+zone_only: true
+require_zone_markers: true
+grid_resolution: 0.10
+max_grid_cells: 16000
+xy_margin: 2.00
+footprint_front: 0.45
+footprint_rear: 0.45
+footprint_half_width: 0.35
+start_clear_padding: 0.06
+inflation_radius: 0.65
+min_clearance: 0.12
+goal_clear_radius: 0.25
+goal_search_radius: 1.20
+planning_goal_index_ahead: 12
+planning_goal_min_dist: 1.20
+planning_goal_min_forward: 0.20
+plan_goal_max_dist: 4.00
+skip_behind_waypoint_x: -0.25
+skip_behind_waypoint_dist: 1.00
+allow_behind_target_dist: 0.80
+local_goal_tolerance: 0.20
+local_waypoint_spacing: 0.30
+min_valid_plan_dist: 0.60
+min_valid_plan_points: 2
+min_forward_target: -0.05
+detour_forward_samples: [1.20, 2.00, 3.00]
+detour_lateral_offsets: [-1.20, -0.90, -0.60, -0.30, 0.30, 0.60, 0.90, 1.20]
+replan_min_interval: 0.20
+blocked_replan_delay: 0.30
+detour_lock_time: 4.00
+blocked_rotate_angle: 0.35
+escape_angular: 0.35
+# 点云、障碍与安全层
+obstacle_timeout: 0.60
+max_obstacle_points: 2500
+cloud_stride: 2
+cloud_keep_radius: 6.00
+scan_min_range: 0.15
+scan_max_range: 6.00
+obstacle_min_z: -1.20
+obstacle_max_z: 0.60
+front_half_width: 0.42
+side_safety_radius: 0.25
+safety_slow_dist: 0.70
+safety_stop_dist: 0.28
+safety_emergency_dist: 0.16
+near_obstacle_angular: 0.35
+# 避障区进入、退出与进度保护
+zone_entry_margin: 0.05
+zone_exit_margin: 0.00
+zone_min_valid_plan_dist: 0.25
+zone_handoff_distance: 0.60
+zone_handoff_early_release: 0.60
+zone_handoff_lateral_tolerance: 0.10
+progress_search_ahead: 12
+progress_search_back: 10
+progress_lateral_limit: 3.00
+progress_heading_tolerance: 0.70
+progress_pass_margin: 0.08
+progress_max_advance: 1.00
+progress_zone_search_ahead: 20
+progress_zone_max_advance: 3.60
+progress_zone_confirm_samples: 3
+progress_zone_confirm_tolerance: 0.30
+progress_recovery_max_advance: 1.80
+progress_recovery_samples: 3
+progress_recovery_tolerance: 0.30
+progress_recovery_speed: 0.25
+odom_jump_threshold: 0.80
+odom_recovery_samples: 5
+"""
 
 
 @dataclass(frozen=True)
@@ -39,7 +143,7 @@ ITEMS = [
     LaunchItem("6. 机械臂任务节点", "source /opt/ros/noetic/setup.bash && source /home/user/miniconda3/etc/profile.d/conda.sh && conda activate piper && source /home/user/fastlio_ws/devel/setup.bash && source /home/user/piper_ws/devel/setup.bash && roslaunch piper_task piper_task.launch enable_camera_relay:=true"),
     LaunchItem("7. MID360 雷达", "cd ~/livox_ws && source devel/setup.bash && roslaunch livox_ros_driver2 msg_MID360.launch"),
     LaunchItem("8. S-FAST_LIO 重定位", "cd ~/fastlio_ws && source devel/setup.bash && source ~/livox_ws/devel/setup.bash --extend && roslaunch sfast_lio mapping_mid360_relocalization.launch rviz:=true"),
-    LaunchItem("9. 比赛总控", "source /opt/ros/noetic/setup.bash && source /home/user/fastlio_ws/devel/setup.bash && RACE_CSV=/home/user/fastlio_ws/src/waypoint_tools/data/{route} && CRUISE_SPEED={speed} && roslaunch final_mission final_race.launch csv_path:=${RACE_CSV} target_speed:=${CRUISE_SPEED} wait_for_start:=true auto_start:=false enable_vision:=true show_image:=true"),
+    LaunchItem("9. 比赛总控", "source /opt/ros/noetic/setup.bash && source /home/user/fastlio_ws/devel/setup.bash && RACE_CSV=/home/user/fastlio_ws/src/waypoint_tools/data/{route} && CRUISE_SPEED={speed} && AVOIDANCE_SPEED={avoid_speed} && roslaunch final_mission final_race.launch csv_path:=${RACE_CSV} target_speed:=${CRUISE_SPEED} avoidance_speed:=${AVOIDANCE_SPEED} wait_for_start:=true auto_start:=false enable_vision:=true show_image:=true"),
 ]
 
 
@@ -98,6 +202,33 @@ class Launcher(QMainWindow):
         hint = QLabel("绿色 = 命令成功完成 / 服务进程稳定运行（等待 5 秒）。所有命令会在同一终端窗口的不同标签页中运行。")
         hint.setWordWrap(True)
         layout.addWidget(hint)
+        tuning = QHBoxLayout()
+        tuning.addWidget(QLabel("测试速度："))
+        self.avoid_speed_input = QDoubleSpinBox()
+        self.avoid_speed_input.setRange(0.03, 1.50)
+        self.avoid_speed_input.setSingleStep(0.05)
+        self.avoid_speed_input.setValue(0.20)
+        self.avoid_speed_input.setSuffix(" m/s")
+        tuning.addWidget(self.avoid_speed_input)
+        tuning.addWidget(QLabel("障碍膨胀："))
+        self.avoid_inflation_input = QDoubleSpinBox()
+        self.avoid_inflation_input.setRange(0.10, 1.50)
+        self.avoid_inflation_input.setSingleStep(0.05)
+        self.avoid_inflation_input.setValue(0.65)
+        self.avoid_inflation_input.setSuffix(" m")
+        tuning.addWidget(self.avoid_inflation_input)
+        reset_avoid_params = QPushButton("恢复避障默认参数")
+        reset_avoid_params.clicked.connect(self.reset_avoidance_params)
+        tuning.addWidget(reset_avoid_params)
+        tuning.addStretch()
+        layout.addLayout(tuning)
+        self.avoid_params_input = QPlainTextEdit()
+        self.avoid_params_input.setPlainText(AVOIDANCE_TEST_PARAM_TEMPLATE)
+        self.avoid_params_input.setPlaceholderText("YAML 参数覆盖")
+        self.avoid_params_input.setToolTip("仅影响下一次独立避障测试。参数名必须来自默认列表，避免误改 ROS 话题或任务流程。")
+        self.avoid_params_input.setMaximumHeight(145)
+        layout.addWidget(QLabel("高级避障参数覆盖（可滚动编辑，速度和膨胀半径以上方控件为准）："))
+        layout.addWidget(self.avoid_params_input)
         self.all_button = QPushButton("一键顺序启动全部比赛服务")
         self.all_button.setMinimumHeight(48)
         self.all_button.clicked.connect(self.start_all)
@@ -108,12 +239,23 @@ class Launcher(QMainWindow):
         self.speed_input.setRange(0.05, 2.00)
         self.speed_input.setSingleStep(0.05)
         self.speed_input.setDecimals(2)
-        self.speed_input.setValue(0.80)
+        self.speed_input.setValue(0.90)
         self.speed_input.setSuffix(" m/s")
         self.speed_input.setToolTip("仅用于第 9 项“比赛总控”的 target_speed")
         speed_row.addWidget(self.speed_input)
+        speed_row.addWidget(QLabel("避障区速度："))
+        self.race_avoid_speed_input = QDoubleSpinBox()
+        self.race_avoid_speed_input.setRange(0.08, 2.00)
+        self.race_avoid_speed_input.setSingleStep(0.05)
+        self.race_avoid_speed_input.setDecimals(2)
+        self.race_avoid_speed_input.setValue(0.70)
+        self.race_avoid_speed_input.setSuffix(" m/s")
+        self.race_avoid_speed_input.setToolTip(
+            "仅在 CSV 的 avoid_start 到 avoid_end 避障区间生效；其余路段仍使用比赛速度"
+        )
+        speed_row.addWidget(self.race_avoid_speed_input)
         speed_row.addWidget(QLabel("路径文件："))
-        self.race_file_input = QLineEdit("final03.csv")
+        self.race_file_input = QLineEdit("final07.csv")
         self.race_file_input.setPlaceholderText("例如 final03.csv")
         self.race_file_input.setToolTip("第 9 项总控使用的 CSV，位于 waypoint_tools/data/")
         speed_row.addWidget(self.race_file_input)
@@ -235,11 +377,21 @@ class Launcher(QMainWindow):
         none_button.clicked.connect(lambda: [box.setChecked(False) for box in self.task_checkboxes.values()])
         start_button = QPushButton("以 1.00 m/s 启动单独测试")
         start_button.clicked.connect(self.start_single_task_test)
+        avoid_button = QPushButton("避障区独立测试（自动重定位）")
+        avoid_button.clicked.connect(self.start_avoidance_test)
+        avoid_confirm_button = QPushButton("确认定位后，开始避障")
+        avoid_confirm_button.clicked.connect(self.enable_avoidance_tracking)
         actions.addWidget(all_button)
         actions.addWidget(none_button)
         actions.addWidget(start_button)
+        actions.addWidget(avoid_button)
+        actions.addWidget(avoid_confirm_button)
         layout.addLayout(actions)
-        self.single_test_message = QLabel("路径文件使用主界面的“路径文件”输入框。")
+        self.single_test_message = QLabel(
+            "路径文件使用主界面的“路径文件”输入框。避障区独立测试会截取首个 "
+            "avoid_start/avoid_end 区间前后短路线，并使用已实测保存的 S-FAST-LIO 初始位姿。"
+            "启动后车辆保持静止，确认 RViz 定位正确后再点击“确认定位后，开始避障”。"
+        )
         self.single_test_message.setWordWrap(True)
         layout.addWidget(self.single_test_message)
         layout.addStretch()
@@ -279,6 +431,175 @@ class Launcher(QMainWindow):
         self.run_debug_command("单独任务测试", command)
         names = "、".join(sorted(selected)) if selected else "无（纯巡航）"
         self.single_test_message.setText("已生成 %s；测试任务：%s" % (test_path.name, names))
+
+    @staticmethod
+    def _task_name(row):
+        """返回规范化任务名；避障标记不带 ext:，仍兼容手工写入的 ext:。"""
+        task = (row.get("task") or "").strip().lower()
+        return task[4:] if task.startswith("ext:") else task
+
+    @staticmethod
+    def _window_after(rows, index, distance):
+        """找出出口后至少 distance 米的 CSV 终点。"""
+        end, covered = index, 0.0
+        while end < len(rows) - 1 and covered < distance:
+            current, following = rows[end], rows[end + 1]
+            covered += math.hypot(
+                float(following["x"]) - float(current["x"]),
+                float(following["y"]) - float(current["y"]),
+            )
+            end += 1
+        return end
+
+    def start_avoidance_test(self):
+        """从首个避障区附近启动重定位与仅跟踪/避障的临时 launch。"""
+        filename = self.race_file_name(show_error=True)
+        if not filename:
+            return
+        source = Path("/home/user/fastlio_ws/src/waypoint_tools/data") / filename
+        try:
+            with source.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                fields, rows = reader.fieldnames, list(reader)
+            required = {"x", "y", "z", "qx", "qy", "qz", "qw", "task"}
+            if not fields or not required.issubset(fields):
+                raise ValueError("CSV 缺少避障测试所需的位姿或 task 列")
+
+            start_index = end_index = None
+            for index, row in enumerate(rows):
+                task = self._task_name(row)
+                if task == "avoid_start" and start_index is None:
+                    start_index = index
+                elif task == "avoid_end" and start_index is not None:
+                    end_index = index
+                    break
+            if start_index is None or end_index is None:
+                raise ValueError("未找到一对完整的 avoid_start / avoid_end 标记")
+
+            # 固定实测位姿位于 avoid_start 附近（已在避障区入口处），短路线必须
+            # 直接从入口标记开始。若保留入口前 2m，跟踪器会把初始投影视为不合理
+            # 的进度跳变并安全锁止。
+            first = start_index
+            last = self._window_after(rows, end_index, 1.5)
+            test_rows = [dict(row) for row in rows[first:last + 1]]
+            for row in test_rows:
+                if self._task_name(row) not in ("avoid_start", "avoid_end"):
+                    row["task"] = "none"
+
+            timestamp = int(time.time())
+            test_path = STATUS_DIR / ("avoidance_test_%d.csv" % timestamp)
+            with test_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(test_rows)
+
+            # 外层 launch 在 include 完成后覆盖初始位姿；roslaunch 会先设置完
+            # 全部参数再启动节点。此处使用实车确认过的固定避障测试位姿，
+            # 而不是用 CSV 航点近似车辆的实际停放位姿。
+            init_pos = AVOIDANCE_TEST_INITIAL_POS
+            init_rot = AVOIDANCE_TEST_INITIAL_ROT
+            launch_path = STATUS_DIR / ("avoidance_test_%d.launch" % timestamp)
+            overrides_path = STATUS_DIR / ("avoidance_params_%d.yaml" % timestamp)
+            overrides = self.avoidance_param_overrides()
+            overrides["target_speed"] = round(self.avoid_speed_input.value(), 3)
+            try:
+                configured_max_linear = float(overrides.get("max_linear", 0.0))
+            except ValueError:
+                raise ValueError("max_linear 必须是数值")
+            overrides["max_linear"] = max(configured_max_linear, overrides["target_speed"])
+            overrides["inflation_radius"] = round(self.avoid_inflation_input.value(), 3)
+            overrides_path.write_text(
+                "\n".join("%s: %s" % (key, value) for key, value in overrides.items()) + "\n",
+                encoding="utf-8",
+            )
+            launch_path.write_text("""<launch>
+  <!-- 自动生成：仅用于避障区实车测试，退出本 launch 会同时停止重定位和跟踪。 -->
+  <include file=\"$(find sfast_lio)/launch/mapping_mid360_relocalization.launch\">
+    <arg name=\"rviz\" value=\"true\"/>
+  </include>
+  <rosparam param=\"/mapping/init_pos\">[%s]</rosparam>
+  <rosparam param=\"/mapping/init_rot\">[%s]</rosparam>
+  <node pkg=\"final_mission\" type=\"final_tracker.py\" name=\"final_tracker\" output=\"screen\" required=\"true\">
+    <rosparam command=\"load\" file=\"$(find final_mission)/config/tracker.yaml\"/>
+    <rosparam command=\"load\" file=\"%s\"/>
+    <param name=\"csv_path\" value=\"%s\"/>
+    <param name=\"cmd_topic\" value=\"/smoother_cmd_vel\"/>
+    <!-- 必须由界面中的“确认定位后，开始避障”显式放行。 -->
+    <param name=\"enabled\" value=\"false\"/>
+    <param name=\"enable_topic\" value=\"/avoidance_test/tracker_enable\"/>
+  </node>
+</launch>
+""" % (
+                ", ".join("%.8f" % value for value in init_pos),
+                ", ".join("%.8f" % value for value in init_rot),
+                str(overrides_path),
+                str(test_path),
+            ), encoding="utf-8")
+        except (OSError, ValueError, KeyError) as error:
+            QMessageBox.critical(self, "创建避障测试失败", str(error))
+            return
+
+        if QMessageBox.question(
+            self, "确认避障区独立测试",
+            "将启动新的 S-FAST-LIO 重定位和避障跟踪，但跟踪器初始保持禁用、车辆不会自动行驶。"
+            "请确认底盘、MID360、ROS Master 已运行，"
+            "且已有重定位/跟踪/速度控制节点均已停止；车辆应停在已保存的避障测试起始位姿附近。继续？",
+            QMessageBox.Yes | QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        command = (
+            "source /opt/ros/noetic/setup.bash && source /home/user/fastlio_ws/devel/setup.bash "
+            "&& source /home/user/livox_ws/devel/setup.bash --extend && roslaunch %s"
+        ) % shlex.quote(str(launch_path))
+        self.run_debug_command("避障区独立测试", command)
+        self.single_test_message.setText(
+            "已生成 %s：使用固定实测位姿重定位；短路线从原路线第 %d 个航点开始。"
+            "请保持车辆静止，确认 RViz 定位正确后点击“确认定位后，开始避障”。"
+            % (test_path.name, first + 1)
+        )
+
+    def enable_avoidance_tracking(self):
+        """由人工确认定位后才打开临时避障跟踪器的速度输出。"""
+        if QMessageBox.question(
+            self, "确认开始避障",
+            "确认 RViz 中实时点云与地图重合，且车辆位置、朝向与短路线首点一致？"
+            "确认后跟踪器将开始向 /smoother_cmd_vel 输出低速指令。",
+            QMessageBox.Yes | QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        command = (
+            "source /opt/ros/noetic/setup.bash && rostopic pub -1 "
+            "/avoidance_test/tracker_enable std_msgs/Bool \"data: true\""
+        )
+        self.run_debug_command("开始避障跟踪", command)
+        self.single_test_message.setText("已发送避障跟踪使能；如需停车，请在避障测试终端按 Ctrl+C 或使用底盘急停。")
+
+    def reset_avoidance_params(self):
+        self.avoid_speed_input.setValue(0.20)
+        self.avoid_inflation_input.setValue(0.65)
+        self.avoid_params_input.setPlainText(AVOIDANCE_TEST_PARAM_TEMPLATE)
+        self.single_test_message.setText("避障测试参数已恢复为默认值；仅影响下一次独立测试。")
+
+    def avoidance_param_overrides(self):
+        """校验高级编辑框，仅允许覆盖已暴露的避障参数。"""
+        allowed = set()
+        for line in AVOIDANCE_TEST_PARAM_TEMPLATE.splitlines():
+            if ":" in line and not line.lstrip().startswith("#"):
+                allowed.add(line.split(":", 1)[0].strip())
+        overrides = {}
+        for number, raw_line in enumerate(self.avoid_params_input.toPlainText().splitlines(), 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                raise ValueError("高级参数第 %d 行缺少冒号" % number)
+            key, value = (part.strip() for part in line.split(":", 1))
+            if key not in allowed:
+                raise ValueError("高级参数第 %d 行不支持 %s" % (number, key))
+            if not value:
+                raise ValueError("高级参数第 %d 行的 %s 没有值" % (number, key))
+            overrides[key] = value
+        return overrides
 
     def selected_route_file(self):
         """返回 data 目录内的安全文件名，避免误写到其它目录。"""
@@ -376,7 +697,12 @@ class Launcher(QMainWindow):
         # "-- 命令 --tab ..."：那个 -- 会终止 gnome-terminal 的选项解析。
         args = ["gnome-terminal"]
         for i, item in enumerate(ITEMS):
-            command = item.command.replace("{speed}", "%.2f" % self.speed_input.value()).replace("{route}", self.race_file_name() or "final03.csv")
+            command = (
+                item.command
+                .replace("{speed}", "%.2f" % self.speed_input.value())
+                .replace("{avoid_speed}", "%.2f" % self.race_avoid_speed_input.value())
+                .replace("{route}", self.race_file_name() or "final03.csv")
+            )
             runner_args = ["python3", "-c", script, str(self.status_files[i]), base64.b64encode(command.encode()).decode(), "1" if item.persistent else "0", "1" if item.accept_successful_exit else "0", str(self.gate_files[i])]
             args.extend(["--title=比赛启动终端", "--window" if i == 0 else "--tab", "--command=" + shlex.join(runner_args)])
         try:

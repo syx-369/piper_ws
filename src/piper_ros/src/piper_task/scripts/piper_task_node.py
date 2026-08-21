@@ -773,9 +773,9 @@ class CompetitionTaskNode:
         self.publish_state("pick%d:approaching" % candidate)
         T_approach = T_OBJECT_TO_GRASP.copy()
         # 最终夹取点向左（+Y）补偿 1 cm，并累计沿 +X 向下补偿 2 cm。
-        # 瓶子抓取时将前探方向（+Z）由 60 mm 改为 58 mm，使夹爪后退
+        # 瓶子抓取时将前探方向（+Z）由 60 mm 改为 57 mm，使夹爪后退
         # 2 mm；方块仍使用原位置，避免影响已经调好的方块抓取。
-        approach_forward = 0.058 if target_type == "bottle" else 0.06
+        approach_forward = 0.057 if target_type == "bottle" else 0.06
         T_approach[0:3, 3] = [-0.01, -0.02, approach_forward]
         target_ee_approach = T_base_object @ T_approach @ T_EE_TO_TOOL
         self.log_pick_pose_target("approach", target_ee_approach)
