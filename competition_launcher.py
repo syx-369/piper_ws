@@ -10,11 +10,12 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from PyQt5.QtCore import QTimer
-from PyQt5.QtWidgets import QApplication, QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QApplication, QCheckBox, QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget
 
 
 STATUS_DIR = Path("/tmp/competition_launcher_status")
@@ -140,11 +141,15 @@ class Launcher(QMainWindow):
         debug_button = QPushButton("进入调试界面 →")
         debug_button.clicked.connect(self.show_debug_page)
         navigation.addWidget(debug_button)
+        test_button = QPushButton("单独任务测试 →")
+        test_button.clicked.connect(lambda: self.pages.setCurrentIndex(2))
+        navigation.addWidget(test_button)
         layout.addLayout(navigation)
 
         self.pages = QStackedWidget()
         self.pages.addWidget(root)
         self.pages.addWidget(self.create_debug_page())
+        self.pages.addWidget(self.create_single_test_page())
         self.setCentralWidget(self.pages)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
@@ -205,6 +210,75 @@ class Launcher(QMainWindow):
 
     def show_debug_page(self):
         self.pages.setCurrentIndex(1)
+
+    def create_single_test_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        title = QLabel("单独任务测试")
+        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.addWidget(title)
+        hint = QLabel("勾选要测试的任务。未勾选的外部任务会写入临时航迹并改为普通巡航点，以 1.00 m/s 通过；避障区和终点始终保留。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.task_checkboxes = {}
+        tasks = [("traffic_light", "红绿灯检测点")] + [("piper_stop_%d" % i, "机械臂任务点 %d" % i) for i in range(1, 8)]
+        grid = QGridLayout()
+        for i, (task, label) in enumerate(tasks):
+            check = QCheckBox(label)
+            self.task_checkboxes[task] = check
+            grid.addWidget(check, i // 2, i % 2)
+        layout.addLayout(grid)
+        actions = QHBoxLayout()
+        all_button = QPushButton("全选")
+        all_button.clicked.connect(lambda: [box.setChecked(True) for box in self.task_checkboxes.values()])
+        none_button = QPushButton("全不选")
+        none_button.clicked.connect(lambda: [box.setChecked(False) for box in self.task_checkboxes.values()])
+        start_button = QPushButton("以 1.00 m/s 启动单独测试")
+        start_button.clicked.connect(self.start_single_task_test)
+        actions.addWidget(all_button)
+        actions.addWidget(none_button)
+        actions.addWidget(start_button)
+        layout.addLayout(actions)
+        self.single_test_message = QLabel("路径文件使用主界面的“路径文件”输入框。")
+        self.single_test_message.setWordWrap(True)
+        layout.addWidget(self.single_test_message)
+        layout.addStretch()
+        back = QPushButton("← 返回比赛启动界面")
+        back.clicked.connect(lambda: self.pages.setCurrentIndex(0))
+        layout.addWidget(back)
+        return page
+
+    def start_single_task_test(self):
+        filename = self.race_file_name(show_error=True)
+        if not filename:
+            return
+        source = Path("/home/user/fastlio_ws/src/waypoint_tools/data") / filename
+        selected = {name for name, box in self.task_checkboxes.items() if box.isChecked()}
+        if QMessageBox.question(self, "确认单独测试", "将以 1.00 m/s 自动启动；未选外部任务会直接通过。确认周边安全后继续？", QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            with source.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                fields, rows = reader.fieldnames, list(reader)
+            if not fields or "task" not in fields:
+                raise ValueError("CSV 缺少 task 列")
+            for row in rows:
+                task = (row.get("task") or "").strip()
+                name = task[4:] if task.startswith("ext:") else task
+                if task.startswith("ext:") and name != "finish" and name not in selected:
+                    row["task"] = "none"
+            test_path = STATUS_DIR / ("single_test_%d.csv" % int(time.time()))
+            with test_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "创建测试航迹失败", str(error))
+            return
+        command = "source /opt/ros/noetic/setup.bash && source /home/user/fastlio_ws/devel/setup.bash && roslaunch final_mission final_race.launch csv_path:=%s target_speed:=1.00 wait_for_start:=false auto_start:=true enable_vision:=true show_image:=true" % shlex.quote(str(test_path))
+        self.run_debug_command("单独任务测试", command)
+        names = "、".join(sorted(selected)) if selected else "无（纯巡航）"
+        self.single_test_message.setText("已生成 %s；测试任务：%s" % (test_path.name, names))
 
     def selected_route_file(self):
         """返回 data 目录内的安全文件名，避免误写到其它目录。"""
