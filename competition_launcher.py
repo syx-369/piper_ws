@@ -143,7 +143,7 @@ ITEMS = [
     LaunchItem("6. 机械臂任务节点", "source /opt/ros/noetic/setup.bash && source /home/user/miniconda3/etc/profile.d/conda.sh && conda activate piper && source /home/user/fastlio_ws/devel/setup.bash && source /home/user/piper_ws/devel/setup.bash && roslaunch piper_task piper_task.launch enable_camera_relay:=true"),
     LaunchItem("7. MID360 雷达", "cd ~/livox_ws && source devel/setup.bash && roslaunch livox_ros_driver2 msg_MID360.launch"),
     LaunchItem("8. S-FAST_LIO 重定位", "cd ~/fastlio_ws && source devel/setup.bash && source ~/livox_ws/devel/setup.bash --extend && roslaunch sfast_lio mapping_mid360_relocalization.launch rviz:=true"),
-    LaunchItem("9. 比赛总控", "source /opt/ros/noetic/setup.bash && source /home/user/fastlio_ws/devel/setup.bash && RACE_CSV=/home/user/fastlio_ws/src/waypoint_tools/data/{route} && CRUISE_SPEED={speed} && AVOIDANCE_SPEED={avoid_speed} && roslaunch final_mission final_race.launch csv_path:=${RACE_CSV} target_speed:=${CRUISE_SPEED} avoidance_speed:=${AVOIDANCE_SPEED} wait_for_start:=true auto_start:=false enable_vision:=true show_image:=true"),
+    LaunchItem("9. 比赛总控", "source /opt/ros/noetic/setup.bash && source /home/user/fastlio_ws/devel/setup.bash && RACE_CSV=/home/user/fastlio_ws/src/waypoint_tools/data/{route} && CRUISE_SPEED={speed} && POST_PLACE_SPEED={post_place_speed} && AVOIDANCE_SPEED={avoid_speed} && roslaunch final_mission final_race.launch csv_path:=${RACE_CSV} target_speed:=${CRUISE_SPEED} post_place_speed:=${POST_PLACE_SPEED} avoidance_speed:=${AVOIDANCE_SPEED} wait_for_start:=true auto_start:=false enable_vision:=true show_image:=true"),
 ]
 
 
@@ -260,6 +260,20 @@ class Launcher(QMainWindow):
         self.race_file_input.setToolTip("第 9 项总控使用的 CSV，位于 waypoint_tools/data/")
         speed_row.addWidget(self.race_file_input)
         layout.addLayout(speed_row)
+        post_place_speed_row = QHBoxLayout()
+        post_place_speed_row.addWidget(QLabel("放置完成 → 避障区起点速度："))
+        self.post_place_speed_input = QDoubleSpinBox()
+        self.post_place_speed_input.setRange(0.08, 2.00)
+        self.post_place_speed_input.setSingleStep(0.05)
+        self.post_place_speed_input.setDecimals(2)
+        self.post_place_speed_input.setValue(0.70)
+        self.post_place_speed_input.setSuffix(" m/s")
+        self.post_place_speed_input.setToolTip(
+            "piper_stop_7 任务完成后生效，到下一处 avoid_start 为止"
+        )
+        post_place_speed_row.addWidget(self.post_place_speed_input)
+        post_place_speed_row.addStretch()
+        layout.addLayout(post_place_speed_row)
         grid = QGridLayout()
         for i, item in enumerate(ITEMS):
             button = QPushButton(item.name)
@@ -700,6 +714,7 @@ class Launcher(QMainWindow):
             command = (
                 item.command
                 .replace("{speed}", "%.2f" % self.speed_input.value())
+                .replace("{post_place_speed}", "%.2f" % self.post_place_speed_input.value())
                 .replace("{avoid_speed}", "%.2f" % self.race_avoid_speed_input.value())
                 .replace("{route}", self.race_file_name() or "final03.csv")
             )

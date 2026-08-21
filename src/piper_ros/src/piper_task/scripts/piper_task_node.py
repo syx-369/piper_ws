@@ -260,32 +260,42 @@ class CompetitionTaskNode:
 
         self.max_rounds = int(rospy.get_param("~max_rounds", 2))
         self.card_confirm_hold_time = max(
-            0.0, float(rospy.get_param("~card_confirm_hold_time", 1.5))
+            0.0, float(rospy.get_param("~card_confirm_hold_time", 0.8))
         )
         # 比赛动作节拍可在 task_config.yaml 中继续调整。限制最大倍率，避免
         # 配置笔误使笛卡尔插值或延迟进入不安全范围。
         self.cartesian_speed_scale = min(
-            2.0, max(0.25, float(rospy.get_param("~cartesian_speed_scale", 1.5)))
+            2.0, max(0.25, float(rospy.get_param("~cartesian_speed_scale", 2.0)))
         )
         self.joint_speed_percent = min(
-            100.0, max(1.0, float(rospy.get_param("~joint_speed_percent", 20.0)))
+            100.0, max(1.0, float(rospy.get_param("~joint_speed_percent", 30.0)))
         )
         self.observation_joint_speed_percent = min(
             100.0,
             max(
                 1.0,
-                float(rospy.get_param("~observation_joint_speed_percent", 30.0)),
+                float(rospy.get_param("~observation_joint_speed_percent", 45.0)),
             ),
         )
         self.place_stow_joint_speed_percent = min(
             100.0,
             max(
                 1.0,
-                float(rospy.get_param("~place_stow_joint_speed_percent", 30.0)),
+                float(rospy.get_param("~place_stow_joint_speed_percent", 60.0)),
             ),
         )
+        self.place_cartesian_speed_scale = min(
+            1.5,
+            max(
+                1.0,
+                float(rospy.get_param("~place_cartesian_speed_scale", 1.25)),
+            ),
+        )
+        self.place_delay_scale = min(
+            1.0, max(0.5, float(rospy.get_param("~place_delay_scale", 0.75)))
+        )
         self.motion_delay_scale = min(
-            2.0, max(0.25, float(rospy.get_param("~motion_delay_scale", 0.6)))
+            2.0, max(0.25, float(rospy.get_param("~motion_delay_scale", 0.4)))
         )
         self.vehicle_stop_actions = rospy.get_param("~vehicle_stop_actions", {})
 
@@ -330,13 +340,16 @@ class CompetitionTaskNode:
         self.publish_state("idle")
         rospy.loginfo(
             "机械臂节拍：笛卡尔速度×%.2f，关节速度=%.0f%%，"
-            "观察位速度=%.0f%%，放置回位速度=%.0f%%，动作等待×%.2f "
+            "观察位速度=%.0f%%，放置笛卡尔额外×%.2f，放置回位速度=%.0f%%，"
+            "动作等待×%.2f，放置等待额外×%.2f "
             "（普通/观察/放置回位等待 %.1fs/%.1fs/%.1fs）",
             self.cartesian_speed_scale,
             self.joint_speed_percent,
             self.observation_joint_speed_percent,
+            self.place_cartesian_speed_scale,
             self.place_stow_joint_speed_percent,
             self.motion_delay_scale,
+            self.place_delay_scale,
             JOINT_MOVE_WAIT_BASE * self.motion_delay_scale,
             JOINT_MOVE_WAIT_BASE
             * self.joint_speed_percent
@@ -517,6 +530,10 @@ class CompetitionTaskNode:
         if duration > 0.0:
             rospy.sleep(duration)
 
+    def wait_after_place_motion(self, base_seconds):
+        """在全局等待倍率基础上进一步缩短放置阶段等待。"""
+        self.wait_after_motion(float(base_seconds) * self.place_delay_scale)
+
     def move_joint_pose(self, positions, speed_percent=None):
         """发送固定关节姿态，并按加速后的节拍等待。"""
         speed_percent = (
@@ -539,8 +556,8 @@ class CompetitionTaskNode:
         ]
         msg.effort = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5]
         self.arm.joint_pub.publish(msg)
-        # 观察位提速时按速度比例同步缩短固定等待：20%/30% 对应
-        # 4.8s→3.2s；普通回零仍保持原等待。
+        # 观察位/放置回位提速时按速度比例同步缩短固定等待。当前默认值下
+        # 普通/观察/放置回位等待分别约为 3.2s、2.1s、1.6s。
         wait_base = JOINT_MOVE_WAIT_BASE * self.joint_speed_percent / speed_percent
         self.wait_after_motion(wait_base)
         return not rospy.is_shutdown()
@@ -876,15 +893,18 @@ class CompetitionTaskNode:
         target_ee_pre = T_base_place_image @ T_pre @ T_EE_TO_TOOL
         self.arm.move_to_target_smooth(
             target_ee_pre,
-            v=self.scaled_cartesian_speed(0.06),
+            v=(
+                self.scaled_cartesian_speed(0.06)
+                * self.place_cartesian_speed_scale
+            ),
             gripper_val=0,
         )
-        self.wait_after_motion(3.5)
+        self.wait_after_place_motion(3.5)
 
         self.publish_state("%s:opening_gripper" % state_prefix)
         self.open_gripper_at_current_pose()
         # 松爪后缩短等待，随后直接回运输零位。
-        self.wait_after_motion(1.0)
+        self.wait_after_place_motion(1.0)
 
         # 松开物品后不再执行额外上抬，直接回运输姿态。
         self.publish_state("%s:moving_to_stow" % state_prefix)
