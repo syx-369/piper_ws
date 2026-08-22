@@ -737,7 +737,26 @@ class PiperVisionController:
         stable_label = None
         stable_hits = 0
 
-        for frame_index in range(REFERENCE_MAX_FRAMES + REFERENCE_WARMUP_FRAMES):
+        # pipeline 在比赛期间始终运行，无需每次卡牌识别都丢弃固定 15 帧。
+        # 仍保留少量可配置预热帧和连续三帧确认，兼顾响应速度与识别可靠性。
+        warmup_frames = max(
+            0,
+            int(rospy.get_param("~reference_warmup_frames", REFERENCE_WARMUP_FRAMES)),
+        )
+        max_frames = max(
+            1, int(rospy.get_param("~reference_max_frames", REFERENCE_MAX_FRAMES))
+        )
+        stable_detections = max(
+            2,
+            int(
+                rospy.get_param(
+                    "~reference_min_stable_detections",
+                    REFERENCE_MIN_STABLE_DETECTIONS,
+                )
+            ),
+        )
+
+        for frame_index in range(max_frames + warmup_frames):
             if rospy.is_shutdown():
                 return None
             try:
@@ -749,7 +768,7 @@ class PiperVisionController:
             color_frame = frames.get_color_frame()
             if not color_frame:
                 continue
-            if frame_index < REFERENCE_WARMUP_FRAMES:
+            if frame_index < warmup_frames:
                 continue
 
             image = np.asanyarray(color_frame.get_data())
@@ -772,7 +791,7 @@ class PiperVisionController:
                 except cv2.error:
                     pass
 
-            if stable_label is not None and stable_hits >= REFERENCE_MIN_STABLE_DETECTIONS:
+            if stable_label is not None and stable_hits >= stable_detections:
                 self.publish_detection_status(
                     "card:success:label=%s:conf=%.2f:hits=%d"
                     % (stable_label, conf, stable_hits)

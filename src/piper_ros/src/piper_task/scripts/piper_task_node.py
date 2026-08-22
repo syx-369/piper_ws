@@ -68,9 +68,6 @@ from piper_task.vision_grasp_core import (
 PICK_SCAN_JOINTS = [-1.530, 0.446, 0.0, 0.0, -0.115, 0.0, 0.0]
 TRANSPORT_JOINTS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 PLACE_SCAN_JOINTS = [-1.602, 0.641, -0.509, 0.0, 0.324, 0.0, 0.0]
-JOINT_MOVE_WAIT_BASE = 8.0
-
-
 # 改动 2026-07-30（2/3）：混入 CameraRelayMixin（原为 PiperVisionController 单继承）
 class CompetitionVisionController(CameraRelayMixin, PiperVisionController):
     """使用固定 ROS 节点名初始化原测试脚本的视觉控制器。"""
@@ -260,28 +257,28 @@ class CompetitionTaskNode:
 
         self.max_rounds = int(rospy.get_param("~max_rounds", 2))
         self.card_confirm_hold_time = max(
-            0.0, float(rospy.get_param("~card_confirm_hold_time", 0.8))
+            0.0, float(rospy.get_param("~card_confirm_hold_time", 0.15))
         )
         # 比赛动作节拍可在 task_config.yaml 中继续调整。限制最大倍率，避免
         # 配置笔误使笛卡尔插值或延迟进入不安全范围。
         self.cartesian_speed_scale = min(
-            2.0, max(0.25, float(rospy.get_param("~cartesian_speed_scale", 2.0)))
+            2.5, max(0.25, float(rospy.get_param("~cartesian_speed_scale", 2.25)))
         )
         self.joint_speed_percent = min(
-            100.0, max(1.0, float(rospy.get_param("~joint_speed_percent", 30.0)))
+            100.0, max(1.0, float(rospy.get_param("~joint_speed_percent", 40.0)))
         )
         self.observation_joint_speed_percent = min(
             100.0,
             max(
                 1.0,
-                float(rospy.get_param("~observation_joint_speed_percent", 45.0)),
+                float(rospy.get_param("~observation_joint_speed_percent", 60.0)),
             ),
         )
         self.place_stow_joint_speed_percent = min(
             100.0,
             max(
                 1.0,
-                float(rospy.get_param("~place_stow_joint_speed_percent", 60.0)),
+                float(rospy.get_param("~place_stow_joint_speed_percent", 70.0)),
             ),
         )
         self.place_cartesian_speed_scale = min(
@@ -292,10 +289,22 @@ class CompetitionTaskNode:
             ),
         )
         self.place_delay_scale = min(
-            1.0, max(0.5, float(rospy.get_param("~place_delay_scale", 0.75)))
+            1.0, max(0.5, float(rospy.get_param("~place_delay_scale", 0.7)))
+        )
+        self.gripper_close_wait = max(
+            0.5, float(rospy.get_param("~gripper_close_wait", 0.65))
+        )
+        self.gripper_open_wait = max(
+            0.3, float(rospy.get_param("~gripper_open_wait", 0.4))
         )
         self.motion_delay_scale = min(
-            2.0, max(0.25, float(rospy.get_param("~motion_delay_scale", 0.4)))
+            2.0, max(0.2, float(rospy.get_param("~motion_delay_scale", 0.3)))
+        )
+        self.joint_motion_verify_timeout = max(
+            0.5, float(rospy.get_param("~joint_motion_verify_timeout", 4.0))
+        )
+        self.joint_settle_time = max(
+            0.0, float(rospy.get_param("~joint_settle_time", 0.1))
         )
         self.vehicle_stop_actions = rospy.get_param("~vehicle_stop_actions", {})
 
@@ -342,7 +351,7 @@ class CompetitionTaskNode:
             "机械臂节拍：笛卡尔速度×%.2f，关节速度=%.0f%%，"
             "观察位速度=%.0f%%，放置笛卡尔额外×%.2f，放置回位速度=%.0f%%，"
             "动作等待×%.2f，放置等待额外×%.2f "
-            "（普通/观察/放置回位等待 %.1fs/%.1fs/%.1fs）",
+            "（关节实时到位确认 timeout=%.1fs，settle=%.2fs）",
             self.cartesian_speed_scale,
             self.joint_speed_percent,
             self.observation_joint_speed_percent,
@@ -350,15 +359,8 @@ class CompetitionTaskNode:
             self.place_stow_joint_speed_percent,
             self.motion_delay_scale,
             self.place_delay_scale,
-            JOINT_MOVE_WAIT_BASE * self.motion_delay_scale,
-            JOINT_MOVE_WAIT_BASE
-            * self.joint_speed_percent
-            / self.observation_joint_speed_percent
-            * self.motion_delay_scale,
-            JOINT_MOVE_WAIT_BASE
-            * self.joint_speed_percent
-            / self.place_stow_joint_speed_percent
-            * self.motion_delay_scale,
+            self.joint_motion_verify_timeout,
+            self.joint_settle_time,
         )
         rospy.loginfo(
             "piper_task ready: command topic=%s, "
@@ -556,10 +558,14 @@ class CompetitionTaskNode:
         ]
         msg.effort = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5]
         self.arm.joint_pub.publish(msg)
-        # 观察位/放置回位提速时按速度比例同步缩短固定等待。当前默认值下
-        # 普通/观察/放置回位等待分别约为 3.2s、2.1s、1.6s。
-        wait_base = JOINT_MOVE_WAIT_BASE * self.joint_speed_percent / speed_percent
-        self.wait_after_motion(wait_base)
+        # 不再使用按最慢速度估算的固定 sleep。实时反馈一旦连续稳定到位便
+        # 立即继续；若未到位则拒绝进入视觉/抓放阶段，避免提速损失成功率。
+        if not self.wait_joint_pose(
+            positions, timeout=self.joint_motion_verify_timeout
+        ):
+            return False
+        if self.joint_settle_time > 0.0:
+            rospy.sleep(self.joint_settle_time)
         return not rospy.is_shutdown()
 
     def log_pick_pose_target(self, stage, target_pose):
@@ -602,11 +608,15 @@ class CompetitionTaskNode:
             age_text,
         )
 
-    def wait_joint_pose(self, positions):
+    def wait_joint_pose(self, positions, timeout=None):
         """用真实关节反馈确认前六轴到达指定姿态。"""
-        timeout = max(
-            0.1, float(rospy.get_param("~runtime_joint_verify_timeout", 3.0))
-        )
+        if timeout is None:
+            timeout = max(
+                0.1,
+                float(rospy.get_param("~runtime_joint_verify_timeout", 3.0)),
+            )
+        else:
+            timeout = max(0.1, float(timeout))
         tolerance = max(
             0.001, float(rospy.get_param("~runtime_joint_tolerance", 0.05))
         )
@@ -694,6 +704,7 @@ class CompetitionTaskNode:
         self.arm.pub.publish(cmd)
 
     def execute_card(self):
+        stage_started_at = time.monotonic()
         if self.carried_target_label is not None:
             return False, "already_carrying=%s" % self.carried_target_label
         if self.completed_rounds >= self.max_rounds:
@@ -710,10 +721,12 @@ class CompetitionTaskNode:
             speed_percent=self.observation_joint_speed_percent,
         ):
             return False, "reference_scan_failed"
+        scan_ready_at = time.monotonic()
 
         self.publish_state("card:recognizing_reference")
         self.arm.detection_context = "card"
         selected_label = self.arm.recognize_reference_target()
+        recognized_at = time.monotonic()
         target_type = self.arm.target_type_from_label(selected_label)
         if target_type is None:
             return False, "reference_not_recognized"
@@ -723,6 +736,14 @@ class CompetitionTaskNode:
         rospy.sleep(self.card_confirm_hold_time)
         self.selected_target_label = selected_label
         self.publish_target(selected_label)
+
+        rospy.loginfo(
+            "卡牌阶段耗时：到观察位 %.2fs，识别 %.2fs，确认停留 %.2fs，总计 %.2fs。",
+            scan_ready_at - stage_started_at,
+            recognized_at - scan_ready_at,
+            self.card_confirm_hold_time,
+            time.monotonic() - stage_started_at,
+        )
 
         rospy.loginfo(
             "目标卡片识别完成: %s",
@@ -806,7 +827,8 @@ class CompetitionTaskNode:
 
         self.publish_state("pick%d:closing_gripper" % candidate)
         self.close_gripper_at_current_pose()
-        self.wait_after_motion(2.0)
+        # 夹爪需要完整闭合才能抬升；使用独立下限，不随全局提速继续压缩。
+        rospy.sleep(self.gripper_close_wait)
 
         self.publish_state("pick%d:lifting" % candidate)
         T_up = T_OBJECT_TO_GRASP.copy()
@@ -903,8 +925,8 @@ class CompetitionTaskNode:
 
         self.publish_state("%s:opening_gripper" % state_prefix)
         self.open_gripper_at_current_pose()
-        # 松爪后缩短等待，随后直接回运输零位。
-        self.wait_after_place_motion(1.0)
+        # 保留可靠松爪时间，避免全局等待倍率过低时物品尚未释放便开始收臂。
+        rospy.sleep(self.gripper_open_wait)
 
         # 松开物品后不再执行额外上抬，直接回运输姿态。
         self.publish_state("%s:moving_to_stow" % state_prefix)
@@ -955,8 +977,6 @@ class CompetitionTaskNode:
             speed_percent=self.observation_joint_speed_percent,
         ):
             return False, "place_scan_failed"
-        if not self.wait_joint_pose(PLACE_SCAN_JOINTS):
-            return False, "place_scan_not_verified"
         return True, "place_scan_ready"
 
     def execute_place_any(self):
@@ -993,7 +1013,7 @@ class CompetitionTaskNode:
 
         self.publish_state("recovery:moving_to_pick_scan")
         # 回退期间机械臂通常已保持在该观察位。若反馈确认已到位，直接放行，
-        # 避免每次恢复都重复执行 move_joint_pose() 的缩放后固定等待。
+        # 避免每次恢复都重复发送关节运动并再次等待实时反馈收敛。
         if self.is_joint_pose_reached(PICK_SCAN_JOINTS):
             rospy.loginfo("回退恢复：机械臂已在抓取观察位，跳过重复关节运动。")
             return True, "pick_scan_already_ready"
@@ -1002,8 +1022,6 @@ class CompetitionTaskNode:
             speed_percent=self.observation_joint_speed_percent,
         ):
             return False, "pick_scan_failed"
-        if not self.wait_joint_pose(PICK_SCAN_JOINTS):
-            return False, "pick_scan_not_verified"
         return True, "pick_scan_ready"
 
     def execute_abort_round(self):
@@ -1064,8 +1082,6 @@ class CompetitionTaskNode:
     def execute_stow(self):
         if not self.move_joint_pose(TRANSPORT_JOINTS):
             return False, "stow_path_failed"
-        if not self.wait_joint_pose(TRANSPORT_JOINTS):
-            return False, "stow_not_verified"
         return True, "stowed_verified"
 
     def on_shutdown(self):
